@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local agent tooling (machine-specific, contains absolute home paths)
+.atl/
+
+# Captured ESC/POS byte dumps produced by --dump-bytes.
+# These are raw print jobs and may contain personal data such as passenger
+# names and document numbers. Never commit a capture taken from real data.
+# A sanitised fixture may be added deliberately with `git add -f`.
+*.bin
+
+# Rendered output
+*.png
+
+# Local agent instructions (not part of the project)
+CLAUDE.md
