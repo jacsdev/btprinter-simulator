@@ -349,7 +349,11 @@ def _make_connection_event_handler(status_store: "_StatusStore") -> ConnectionLi
     return on_connection_event
 
 
-def _make_open_handler(viewer: Viewer, implemented_codepages: Optional[Set[int]]) -> Callable[[str], None]:
+def _make_open_handler(
+    viewer: Viewer,
+    implemented_codepages: Optional[Set[int]],
+    status_store: Optional["_StatusStore"] = None,
+) -> Callable[[str], None]:
     """Build the callback wired into `Viewer(on_open=...)`/
     `set_open_handler()`: read a captured byte file, feed it through a
     fresh `Parser`, and replace the viewer's current content with it.
@@ -367,6 +371,17 @@ def _make_open_handler(viewer: Viewer, implemented_codepages: Optional[Set[int]]
     (called below) already wipes any diagnostics collected before the
     file was opened, but does nothing to disambiguate what is added
     afterwards.
+
+    `status_store`: in live mode, `_StatusStore` is the single source of
+    truth for the status bar -- every live chunk accumulates on top of
+    its own internal snapshot (see `run()`'s `on_data`). Reading/writing
+    `viewer.get_status()`/`viewer.update_status()` directly here would
+    bypass that snapshot, so the next live chunk would transform a stale
+    `_StatusStore` snapshot that never learned about this file's counts,
+    silently discarding them. When `status_store` is given, accumulate
+    through it instead, exactly like `on_data` does. `run_replay()` has
+    no `_StatusStore` at all, so it omits this argument and this falls
+    back to reading/writing the viewer's status directly.
     """
 
     def on_open(path: str) -> None:
@@ -378,6 +393,18 @@ def _make_open_handler(viewer: Viewer, implemented_codepages: Optional[Set[int]]
         viewer.call_soon(viewer.update_ops, result.ops, chunk_bytes, result.byte_offsets)
         if tagged_diagnostics:
             viewer.call_soon(viewer.add_diagnostics, tagged_diagnostics)
+        # The status bar's byte/op counters are independent of the
+        # receipt/history panel state that viewer.clear() just wiped --
+        # they accumulate cumulatively across the whole session (live or
+        # replay), exactly like live mode's _StatusStore.on_data().
+        if status_store is not None:
+            status_store.update(lambda status: status.add_bytes(chunk_bytes).add_ops(len(result.ops)))
+        else:
+            get_status = getattr(viewer, "get_status", None)
+            current_status = get_status() if get_status is not None else None
+            if current_status is not None:
+                new_status = current_status.add_bytes(chunk_bytes).add_ops(len(result.ops))
+                viewer.call_soon(viewer.update_status, new_status)
 
     return on_open
 
@@ -389,13 +416,14 @@ def run_replay(args: argparse.Namespace, width_dots: int, implemented_codepages:
     entirely.
     """
     result = replay_file(args.replay, implemented_codepages)
+    chunk_bytes = os.path.getsize(args.replay)
     status = TransportStatus(
         transport=args.transport,
         endpoint=_transport_endpoint_label(args),
         width_mm=args.width,
         codepages_label=args.codepages,
         replay_path=args.replay,
-    )
+    ).add_bytes(chunk_bytes).add_ops(len(result.ops))
     viewer = Viewer(
         width_dots=width_dots,
         title=f"58mm Simulator - Replay: {args.replay}",
@@ -404,7 +432,7 @@ def run_replay(args: argparse.Namespace, width_dots: int, implemented_codepages:
     viewer.set_open_handler(_make_open_handler(viewer, implemented_codepages))
 
     logger.info("replay mode: showing %s (no transport started)", args.replay)
-    viewer.update_ops(result.ops, chunk_bytes=os.path.getsize(args.replay), byte_offsets=result.byte_offsets)
+    viewer.update_ops(result.ops, chunk_bytes=chunk_bytes, byte_offsets=result.byte_offsets)
     if result.diagnostics:
         viewer.add_diagnostics(result.diagnostics)
     viewer.run()
@@ -462,7 +490,7 @@ def run(argv: list[str] | None = None) -> None:
         status_store.update(lambda status: status.reset_counters())
 
     viewer.set_clear_handler(on_clear)
-    viewer.set_open_handler(_make_open_handler(viewer, implemented_codepages))
+    viewer.set_open_handler(_make_open_handler(viewer, implemented_codepages, status_store=status_store))
 
     def on_data(chunk: bytes) -> None:
         if dumper is not None:

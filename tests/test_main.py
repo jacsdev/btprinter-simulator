@@ -563,6 +563,301 @@ def test_make_open_handler_does_not_call_add_diagnostics_for_a_clean_file(tmp_pa
     assert calls["add_diagnostics_called"] is False
 
 
+# -- Defect 1: replay/Open status bar must report real bytes/ops -----------
+
+
+def test_run_replay_status_matches_file_size_and_op_count(monkeypatch, tmp_path):
+    capture = tmp_path / "capture.bin"
+    capture.write_bytes(b"HELLO\x0a")  # 6 bytes -> TextOp + LineFeedOp = 2 ops
+
+    captured = {}
+
+    class _FakeReplayViewer:
+        def __init__(self, *a, **kw):
+            self.ops = []
+            self.status = kw.get("status")
+            captured["viewer"] = self
+
+        def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            self.ops.extend(ops)
+
+        def add_diagnostics(self, diagnostics):
+            pass
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def run(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeReplayViewer)
+
+    main.run(["--replay", str(capture)])
+
+    viewer = captured["viewer"]
+    expected_bytes = capture.stat().st_size
+    assert expected_bytes == 6
+    assert len(viewer.ops) == 2
+    assert viewer.status.bytes_received == expected_bytes
+    assert viewer.status.ops_count == 2
+
+
+def test_run_replay_status_and_history_panel_agree_on_the_same_input(monkeypatch, tmp_path):
+    capture = tmp_path / "capture.bin"
+    capture.write_bytes(b"HELLO WORLD\x0a")
+
+    captured = {}
+
+    class _FakeReplayViewer:
+        def __init__(self, *a, **kw):
+            self.ops = []
+            self.status = kw.get("status")
+            captured["viewer"] = self
+
+        def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            self.ops.extend(ops)
+            captured["chunk_bytes"] = chunk_bytes
+            captured["ops_len"] = len(ops)
+
+        def add_diagnostics(self, diagnostics):
+            pass
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def run(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeReplayViewer)
+
+    main.run(["--replay", str(capture)])
+
+    viewer = captured["viewer"]
+    # Invariant: the status bar counters and the history panel input must
+    # be computed from the exact same byte count/op list for the same
+    # replay input.
+    assert viewer.status.bytes_received == captured["chunk_bytes"]
+    assert viewer.status.ops_count == captured["ops_len"]
+
+
+def test_make_open_handler_updates_status_accumulating_bytes_and_ops(tmp_path):
+    capture = tmp_path / "capture.bin"
+    capture.write_bytes(b"HELLO\x0a")  # 6 bytes -> 2 ops
+
+    from render.viewer import TransportStatus
+
+    initial_status = TransportStatus(
+        transport="tcp",
+        endpoint="port 9100",
+        width_mm=58,
+        codepages_label="all",
+        bytes_received=100,
+        ops_count=5,
+    )
+
+    calls = {"update_status": None}
+
+    class _FakeViewer:
+        def __init__(self):
+            self._status = initial_status
+
+        def clear(self):
+            pass
+
+        def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            pass
+
+        def add_diagnostics(self, diagnostics):
+            pass
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def get_status(self):
+            return self._status
+
+        def update_status(self, status):
+            self._status = status
+            calls["update_status"] = status
+
+    viewer = _FakeViewer()
+    on_open = main._make_open_handler(viewer, implemented_codepages=None)
+
+    on_open(str(capture))
+
+    assert calls["update_status"] is not None
+    assert calls["update_status"].bytes_received == 100 + 6
+    assert calls["update_status"].ops_count == 5 + 2
+
+
+def test_run_replay_open_button_accumulates_on_top_of_initial_replay_status(monkeypatch, tmp_path):
+    capture = tmp_path / "capture.bin"
+    capture.write_bytes(b"HELLO\x0a")  # 6 bytes -> 2 ops
+
+    opened = tmp_path / "opened.bin"
+    opened.write_bytes(b"WORLD!!\x0a")  # 8 bytes -> 2 ops
+
+    captured = {}
+
+    class _FakeReplayViewer:
+        def __init__(self, *a, **kw):
+            self.ops = []
+            self.status = kw.get("status")
+            self.open_handler = None
+            captured["viewer"] = self
+
+        def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            self.ops.extend(ops)
+
+        def add_diagnostics(self, diagnostics):
+            pass
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def run(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_open_handler(self, handler):
+            self.open_handler = handler
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+    monkeypatch.setattr(main, "Viewer", _FakeReplayViewer)
+
+    main.run(["--replay", str(capture)])
+
+    viewer = captured["viewer"]
+    status_before_open = viewer.status
+    assert status_before_open.bytes_received == 6
+    assert status_before_open.ops_count == 2
+
+    viewer.open_handler(str(opened))
+
+    assert viewer.status.bytes_received == 6 + 8
+    assert viewer.status.ops_count == 2 + 2
+
+
+def test_open_during_live_session_does_not_desync_status_store(monkeypatch, tmp_path):
+    # Regression: in live mode, _StatusStore (main.py's _StatusStore) is
+    # the single source of truth for the status bar -- every live chunk
+    # updates it via status_store.update(). _make_open_handler's on_open
+    # used to bypass it entirely (reading/writing viewer.get_status()/
+    # update_status() directly), so the NEXT live chunk transformed
+    # _StatusStore's stale internal snapshot -- which never learned about
+    # the counts Open added -- silently discarding them and making the
+    # displayed counters jump backwards.
+    opened = tmp_path / "opened.bin"
+    opened.write_bytes(b"BBBBBB\x0a")  # 7 bytes -> TextOp + LineFeedOp = 2 ops
+
+    class _FakePort:
+        def __init__(self):
+            self.on_data = None
+
+        def set_connection_listener(self, listener):
+            pass
+
+        def start(self, on_data):
+            self.on_data = on_data
+
+        def stop(self):
+            pass
+
+    fake_port = _FakePort()
+    monkeypatch.setattr(main, "build_transport", lambda *a, **k: fake_port)
+
+    captured = {}
+
+    class _FakeLiveViewer:
+        def __init__(self, *a, **kw):
+            self.status = kw.get("status")
+            self.open_handler = None
+            captured["viewer"] = self
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def update_ops(self, *a, **k):
+            pass
+
+        def add_diagnostics(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def set_open_handler(self, handler):
+            self.open_handler = handler
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeLiveViewer)
+
+    main.run(["--transport", "tcp", "--port", "9100"])
+
+    viewer = captured["viewer"]
+
+    # Live chunk 1: 5 bytes -> TextOp + LineFeedOp = 2 ops.
+    fake_port.on_data(b"AAAA\x0a")
+    assert viewer.status.bytes_received == 5
+    assert viewer.status.ops_count == 2
+
+    # Open button loads a captured file mid-session: counts must
+    # accumulate on top of the live counters, not replace them.
+    viewer.open_handler(str(opened))
+    assert viewer.status.bytes_received == 5 + 7
+    assert viewer.status.ops_count == 2 + 2
+
+    # Live chunk 2, after Open: 10 bytes -> TextOp + LineFeedOp = 2 ops.
+    fake_port.on_data(b"CCCCCCCCC\x0a")
+    assert viewer.status.bytes_received == 5 + 7 + 10
+    assert viewer.status.ops_count == 2 + 2 + 2
+
+
 def test_status_updates_correctly_via_real_tcp_port_when_log_level_is_warning():
     import logging
     import threading

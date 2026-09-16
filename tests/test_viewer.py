@@ -16,7 +16,7 @@ from PIL import Image
 from core.diagnostics import Diagnostic
 from core.ops import CutOp, LineFeedOp, TextOp
 from core.state import PrinterState
-from render.viewer import TransportStatus, Viewer
+from render.viewer import DEFAULT_GEOMETRY, TransportStatus, Viewer
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("BTPRINTER_SKIP_GUI_TESTS") == "1",
@@ -445,5 +445,72 @@ def test_viewer_open_click_does_nothing_when_dialog_is_cancelled(tk_root, monkey
         viewer._on_open_click()
 
         assert calls == []
+    finally:
+        viewer.destroy()
+
+
+# -- default window geometry -------------------------------------------------
+
+
+def test_viewer_requests_default_geometry_on_init(tk_root):
+    viewer = _make_viewer(tk_root)
+    try:
+        tk_root.update_idletasks()
+        size_part = tk_root.geometry().split("+")[0]
+        assert size_part == DEFAULT_GEOMETRY
+        assert DEFAULT_GEOMETRY == "900x700"
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_geometry_does_not_change_for_a_long_receipt(tk_root):
+    viewer = _make_viewer(tk_root)
+    try:
+        tk_root.update_idletasks()
+        before = tk_root.geometry().split("+")[0]
+
+        many_ops = []
+        for i in range(500):
+            many_ops.append(TextOp(text=f"line {i}", style=PrinterState()))
+            many_ops.append(LineFeedOp())
+        viewer.update_ops(many_ops)
+
+        tk_root.update_idletasks()
+        after = tk_root.geometry().split("+")[0]
+
+        assert before == DEFAULT_GEOMETRY
+        assert after == DEFAULT_GEOMETRY
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_never_calls_minsize(tk_root, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tk_root, "minsize", lambda *a, **k: calls.append((a, k)))
+    viewer = _make_viewer(tk_root)
+    try:
+        assert calls == []
+    finally:
+        viewer.destroy()
+
+
+# -- get_status accessor ------------------------------------------------------
+
+
+def test_get_status_returns_the_current_status(tk_root):
+    status = _make_status().listening()
+    viewer = Viewer(width_dots=384, master=tk_root, status=status)
+    try:
+        assert viewer.get_status() is status
+    finally:
+        viewer.destroy()
+
+
+def test_get_status_reflects_update_status_calls(tk_root):
+    viewer = Viewer(width_dots=384, master=tk_root, status=_make_status())
+    try:
+        new_status = _make_status().listening().add_bytes(10).add_ops(1)
+        viewer.update_status(new_status)
+        assert viewer.get_status() is new_status
     finally:
         viewer.destroy()

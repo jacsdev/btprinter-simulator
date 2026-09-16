@@ -40,6 +40,7 @@ from render.scroll_policy import is_scrolled_to_bottom, should_autoscroll_on_new
 
 logger = logging.getLogger("btprinter.render.viewer")
 
+DEFAULT_GEOMETRY = "900x700"  # sensible default window size; never grows/shrinks with receipt content
 _MAX_VISIBLE_HEIGHT = 2000  # viewport cap; the full image is reachable via the scrollbar
 _EMPTY_STATE_HEIGHT = 160  # canvas height while showing the placeholder text
 _SEPARATOR_HEIGHT = 14  # visible gap drawn between two receipt blocks
@@ -242,6 +243,13 @@ class Viewer:
             self._root.title(title)
         else:
             self._root = master
+
+        # Sensible default window size, independent of receipt content --
+        # the receipt canvas scrolls for long receipts instead of the
+        # window growing to fit them (see _build_content_area()). Never
+        # paired with minsize(): the user must still be able to shrink
+        # the window below this size.
+        self._root.geometry(DEFAULT_GEOMETRY)
 
         self._build_toolbar()
         self._build_status_bar()
@@ -471,6 +479,14 @@ class Viewer:
 
     def set_open_handler(self, handler: Optional[Callable[[str], None]]) -> None:
         self._on_open = handler
+
+    def get_status(self) -> Optional[TransportStatus]:
+        """Return the current `TransportStatus` snapshot, or `None` if the
+        viewer was constructed without one. Lets a composition-root
+        callback (e.g. `main._make_open_handler()`'s `on_open`) read the
+        currently displayed counters before accumulating on top of them
+        via `update_status()`."""
+        return self._status
 
     def update_status(self, status: TransportStatus) -> None:
         """Refresh the status bar (and the empty-state message, if it is
