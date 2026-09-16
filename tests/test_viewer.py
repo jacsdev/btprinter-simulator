@@ -357,7 +357,15 @@ def _drive_and_assert_reconciled(viewer: Viewer, data: bytes, chunk_size: int) -
 def test_viewer_reconciles_history_total_with_status_bar_bytes_for_ping_pong_capture(tk_root):
     data = (FIXTURES_DIR / "ping-pong.bin").read_bytes()
 
-    for chunk_size in (len(data), 4096, 1024, 512, 128, 1):
+    # Sizes down to 7 bytes, not 1. On this 29 kB capture a 1-byte sweep
+    # means ~29,000 update_ops calls, each re-rendering a receipt that stays
+    # open until the very last byte, and it cost around 9 seconds of the whole
+    # suite on its own. The defect this guards against -- chunks that produce
+    # no ops being dropped from the byte accounting -- still occurs in the
+    # thousands at 7 bytes, so the coverage loss is negligible. The multi-cut
+    # test below still sweeps down to 1 byte, where the stream is small enough
+    # for that to be free.
+    for chunk_size in (len(data), 4096, 1024, 512, 128, 7):
         viewer = Viewer(width_dots=384, master=tk_root)
         try:
             _drive_and_assert_reconciled(viewer, data, chunk_size)
