@@ -8,6 +8,12 @@ per `CutOp`-terminated group, see `render/receipts.py`). Only depends on
 `render.receipts`/`render.scroll_policy`; it never imports from
 `transport/`.
 
+A receipt already closed by a cut is immutable, so its rendered bitmap
+is cached instead of being rebuilt on every `update_ops()` call (a
+capture arriving in N chunks used to re-render every closed receipt's
+embedded images ~N times); only the still-open trailing receipt is
+always rendered fresh. See `_get_cached_receipt_image()`.
+
 Also owns the persistent status bar and the empty-state placeholder
 shown before any receipt has been rendered (`TransportStatus`,
 `format_status_line`, `format_empty_state_message`). `main.py`, the
@@ -27,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import tkinter as tk
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from tkinter import filedialog
 from typing import Callable, List, Optional, Tuple
@@ -34,6 +41,7 @@ from typing import Callable, List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageTk
 
 from core.diagnostics import Diagnostic
+from core.ops import CutOp
 from render.raster import ReceiptRenderer, ruler_x_position
 from render.receipts import Receipt, split_into_receipts
 from render.scroll_policy import is_scrolled_to_bottom, should_autoscroll_on_new_content
@@ -46,6 +54,16 @@ _EMPTY_STATE_HEIGHT = 160  # canvas height while showing the placeholder text
 _SEPARATOR_HEIGHT = 14  # visible gap drawn between two receipt blocks
 _SEPARATOR_FILL = 190  # light gray, so separate receipts read as separate sheets
 _RULER_FONT = "A"  # the ruler always marks the Font A column budget for the active width
+
+# Cap on how many closed-receipt bitmaps _get_cached_receipt_image() keeps
+# around at once. Without a cap, a very long session (or a single huge
+# replayed capture with many cuts) would accumulate one full-resolution
+# PIL Image per closed receipt for the lifetime of the process. 64 is a
+# generous multiple of what a person normally scrolls back through in one
+# sitting; entries beyond the cap are evicted least-recently-used and
+# simply re-rendered on demand if they are needed again (a cache miss,
+# never a correctness issue -- see _get_cached_receipt_image()).
+_RECEIPT_CACHE_MAX_ENTRIES = 64
 
 _CONNECTION_STATE_LABELS = {
     "starting": "starting...",
@@ -274,6 +292,12 @@ class Viewer:
         self._bytes_total = 0
         self._diagnostics: List[Diagnostic] = []
         self._ruler_visible = False
+        # Cache of already-rendered CLOSED receipts, keyed by (receipt
+        # index, width_dots) -- see _get_cached_receipt_image(). The still
+        # -open trailing receipt is never stored here: new ops can still
+        # extend it, so it must always be rendered fresh. An OrderedDict
+        # gives cheap LRU eviction via move_to_end()/popitem(last=False).
+        self._receipt_image_cache: "OrderedDict[Tuple[int, int], Image.Image]" = OrderedDict()
         self._current_image: Image.Image = self._renderer.render([])
         self._status: Optional[TransportStatus] = status
         self._on_clear = on_clear
@@ -488,6 +512,12 @@ class Viewer:
         self._op_byte_offsets = []
         self._bytes_total = 0
         self._diagnostics = []
+        # Wholesale content replacement: nothing cached under the old
+        # receipt indices is valid for whatever comes next (a fresh
+        # receipt #1 after clear() shares index 0 with the old receipt
+        # #1, but is not the same receipt), so drop every cached bitmap
+        # rather than let a stale one survive under a reused index.
+        self._receipt_image_cache.clear()
         self._current_image = self._renderer.render([])
 
         self._refresh_diagnostics_label()
@@ -613,11 +643,23 @@ class Viewer:
         gap in between, so several prints read as several receipts
         instead of one endless strip. Returns the combined image and the
         y-pixel offset each receipt starts at (for `scroll_to_receipt`).
+
+        A receipt already closed by a `GS V` cut can never change again,
+        so its bitmap is rendered once and cached (see
+        `_get_cached_receipt_image()`); only the still-open trailing
+        receipt, if any, is rendered fresh on every call, since new ops
+        can still arrive for it.
         """
         if not self._receipts:
             return self._renderer.render([]), []
 
-        images = [self._renderer.render(list(receipt.ops)) for receipt in self._receipts]
+        last_index = len(self._receipts) - 1
+        images = [
+            self._renderer.render(list(receipt.ops))
+            if index == last_index and not self._is_closed_receipt(receipt)
+            else self._get_cached_receipt_image(index, receipt)
+            for index, receipt in enumerate(self._receipts)
+        ]
         total_height = sum(img.height for img in images) + _SEPARATOR_HEIGHT * (len(images) - 1)
         combined = Image.new("L", (self.width_dots, max(total_height, 1)), color=255)
 
@@ -635,6 +677,43 @@ class Viewer:
                 y += _SEPARATOR_HEIGHT
 
         return combined, offsets
+
+    @staticmethod
+    def _is_closed_receipt(receipt: Receipt) -> bool:
+        """A receipt is closed once it has been terminated by a `GS V`
+        cut -- i.e. its last op is a `CutOp` (see `render.receipts.
+        split_into_receipts()`). A closed receipt's ops never change
+        again, so its rendered bitmap is safe to cache forever (subject
+        to the LRU cap)."""
+        return bool(receipt.ops) and isinstance(receipt.ops[-1], CutOp)
+
+    def _get_cached_receipt_image(self, index: int, receipt: Receipt) -> Image.Image:
+        """Render (and cache) a CLOSED receipt's image, keyed by its
+        position in `self._receipts` plus `width_dots`.
+
+        Keying on index rather than on the `Receipt` object's identity is
+        safe here specifically because a closed receipt's ops -- and
+        therefore the index it occupies -- never change again once
+        closed: `update_ops()` only ever appends new ops after it.
+        `width_dots` is folded into the key defensively, in case a future
+        change makes it mutable after construction; today it never
+        changes for the lifetime of a `Viewer`. Any wholesale content
+        replacement (`clear()`, and therefore the Open button / --replay
+        path that calls it) drops the whole cache instead, so a reused
+        index can never collide with a different receipt's stale bitmap.
+        """
+        key = (index, self.width_dots)
+        cached = self._receipt_image_cache.get(key)
+        if cached is not None:
+            self._receipt_image_cache.move_to_end(key)
+            return cached
+
+        image = self._renderer.render(list(receipt.ops))
+        self._receipt_image_cache[key] = image
+        self._receipt_image_cache.move_to_end(key)
+        if len(self._receipt_image_cache) > _RECEIPT_CACHE_MAX_ENTRIES:
+            self._receipt_image_cache.popitem(last=False)
+        return image
 
     def _refresh_body(self) -> None:
         """Show the empty-state placeholder while no ops have arrived

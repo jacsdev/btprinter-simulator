@@ -574,6 +574,176 @@ def test_viewer_open_click_does_nothing_when_dialog_is_cancelled(tk_root, monkey
         viewer.destroy()
 
 
+# -- closed-receipt render caching (performance fix) ---------------------
+#
+# update_ops() used to re-render every receipt (including already-closed
+# ones whose pixels can never change again) on every call, so a big
+# capture arriving in N chunks paid for re-rasterising its embedded
+# images ~N times. These tests pin the caching contract: a closed
+# receipt is rendered exactly once, the still-open trailing receipt is
+# always rendered fresh, and every entry point that replaces what is
+# displayed drops the cache instead of serving stale bitmaps.
+
+
+def _spy_on_renderer_render(monkeypatch):
+    """Wrap `ReceiptRenderer.render` so each call's `ops` argument is
+    recorded, while still delegating to the real implementation."""
+    from render.raster import ReceiptRenderer
+
+    calls = []
+    original_render = ReceiptRenderer.render
+
+    def spy(self, ops):
+        calls.append(list(ops))
+        return original_render(self, ops)
+
+    monkeypatch.setattr(ReceiptRenderer, "render", spy)
+    return calls
+
+
+def test_viewer_closed_receipt_is_rendered_exactly_once_across_many_update_ops_calls(tk_root, monkeypatch):
+    viewer = _make_viewer(tk_root)
+    try:
+        calls = _spy_on_renderer_render(monkeypatch)
+
+        viewer.update_ops([TextOp(text="A", style=PrinterState()), CutOp(mode="full")])
+        assert len(calls) == 1  # the newly-closed receipt is rendered once
+
+        for i in range(10):
+            # None of these calls add a new cut -- receipt #1 (index 0)
+            # stays closed and must never be re-rendered again.
+            viewer.update_ops([TextOp(text=f"B{i}", style=PrinterState())])
+
+        closed_receipt_renders = [call for call in calls if call and isinstance(call[-1], CutOp)]
+        assert len(closed_receipt_renders) == 1
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_open_receipt_rerenders_on_every_update_ops_call(tk_root, monkeypatch):
+    viewer = _make_viewer(tk_root)
+    try:
+        calls = _spy_on_renderer_render(monkeypatch)
+
+        viewer.update_ops([TextOp(text="A", style=PrinterState())])
+        viewer.update_ops([TextOp(text="B", style=PrinterState())])
+        viewer.update_ops([TextOp(text="C", style=PrinterState())])
+
+        # No CutOp ever arrives: every call re-renders the same still-open
+        # trailing receipt, because new ops can still extend it -- caching
+        # it would freeze it mid-print.
+        assert len(calls) == 3
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_clear_drops_the_receipt_cache_so_the_same_bytes_render_again(tk_root, monkeypatch):
+    viewer = _make_viewer(tk_root)
+    try:
+        calls = _spy_on_renderer_render(monkeypatch)
+
+        # clear() unconditionally resets _current_image via
+        # self._renderer.render([]) -- a pre-existing, cheap "blank
+        # canvas" call unrelated to receipt caching. Filter it out so
+        # this test only counts renders of actual receipt content.
+        def receipt_render_count() -> int:
+            return len([call for call in calls if call])
+
+        closing_ops = [TextOp(text="A", style=PrinterState()), CutOp(mode="full")]
+        viewer.update_ops(list(closing_ops))
+        assert receipt_render_count() == 1
+
+        viewer.update_ops([TextOp(text="still open", style=PrinterState())])
+        assert receipt_render_count() == 2  # closed receipt cached (no new render), open receipt rendered
+
+        viewer.clear()
+        viewer.update_ops(list(closing_ops))
+
+        # Same closed-receipt bytes fed again after clear() must render
+        # fresh: clear() must drop the whole cache, not just the ops list.
+        assert receipt_render_count() == 3
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_open_after_clear_shows_no_stale_cached_receipt_images(tk_root, monkeypatch):
+    # Mirrors main.py._make_open_handler()'s wholesale-replace path for
+    # the Open button/--replay: clear() the viewer, then feed the newly
+    # opened file's ops. No receipt image from the file that was showing
+    # before may survive into the new content.
+    viewer = _make_viewer(tk_root)
+    try:
+        calls = _spy_on_renderer_render(monkeypatch)
+
+        viewer.update_ops([TextOp(text="FILE_A", style=PrinterState()), CutOp(mode="full")])
+        assert len(calls) == 1
+
+        viewer.clear()
+        viewer.update_ops([TextOp(text="FILE_B", style=PrinterState()), CutOp(mode="full")])
+
+        receipts = viewer.get_receipts()
+        assert len(receipts) == 1
+        assert receipts[0].ops[0].text == "FILE_B"
+
+        # Ignore clear()'s own unconditional render([]) "blank canvas"
+        # call (pre-existing, unrelated to receipt caching): only actual
+        # receipt-content renders matter here.
+        receipt_render_calls_after_clear = [call for call in calls[1:] if call]
+        assert len(receipt_render_calls_after_clear) == 1
+        assert receipt_render_calls_after_clear[0][0].text == "FILE_B"
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_changing_paper_width_invalidates_the_receipt_cache(tk_root, monkeypatch):
+    # There is no public runtime "change paper width" API today (main.py
+    # always constructs a fresh Viewer per --width), but the cache key
+    # must still be defensively scoped to width_dots: a naive cache keyed
+    # only on receipt identity/index would otherwise silently serve a
+    # bitmap rendered for one width when asked to render the same
+    # receipt at another width.
+    viewer = _make_viewer(tk_root)
+    try:
+        calls = _spy_on_renderer_render(monkeypatch)
+
+        viewer.update_ops([TextOp(text="A", style=PrinterState()), CutOp(mode="full")])
+        assert len(calls) == 1
+        receipt = viewer.get_receipts()[0]
+
+        image_w384 = viewer._get_cached_receipt_image(0, receipt)
+        assert len(calls) == 1  # still cached at width 384
+
+        viewer.width_dots = 576
+        image_w576 = viewer._get_cached_receipt_image(0, receipt)
+
+        assert len(calls) == 2  # different width -> fresh render, not the width-384 bitmap
+        assert image_w384 is not image_w576
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_same_input_produces_byte_identical_final_image_whole_or_chunked(tk_root):
+    # Regression guard for the caching fix: the final rendered image must
+    # be pixel-for-pixel identical to what it was before caching was
+    # added, regardless of how the input was chunked.
+    data = (FIXTURES_DIR / "ping-pong.bin").read_bytes()
+
+    def final_image_bytes(chunk_size: int) -> bytes:
+        viewer = Viewer(width_dots=384, master=tk_root)
+        try:
+            _drive_and_assert_reconciled(viewer, data, chunk_size)
+            return viewer.get_current_image().tobytes()
+        finally:
+            viewer.destroy()
+
+    whole = final_image_bytes(len(data))
+    chunked_4096 = final_image_bytes(4096)
+    chunked_1024 = final_image_bytes(1024)
+    chunked_128 = final_image_bytes(128)
+
+    assert whole == chunked_4096 == chunked_1024 == chunked_128
+
+
 # -- default window geometry -------------------------------------------------
 
 
