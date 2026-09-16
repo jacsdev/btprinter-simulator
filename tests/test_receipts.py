@@ -112,3 +112,59 @@ def test_receipt_is_frozen():
         assert False, "Receipt must be immutable"
     except Exception:
         pass
+
+
+# -- total_bytes: honest accounting for a receipt still open, or not yet
+# started, while the caller is buffering a partial op -----------------
+
+
+def test_total_bytes_tops_up_the_trailing_open_receipt_past_its_last_known_op_offset():
+    # The caller has received 50 bytes total, but only 20 of them belong
+    # to a completed op (the rest are still buffered as part of an op
+    # the parser has not finished decoding yet, e.g. a raster image band
+    # split across more than one network chunk). The trailing, not-yet-
+    # cut receipt must be credited with all 50 bytes, not just 20.
+    ops = [_text("A")]
+    receipts = split_into_receipts(ops, byte_offsets=[20], total_bytes=50)
+
+    assert len(receipts) == 1
+    assert receipts[0].byte_count == 50
+
+
+def test_total_bytes_does_not_affect_a_receipt_already_closed_by_a_cut():
+    ops = [_text("A"), CutOp(mode="full")]
+    # total_bytes claims more bytes arrived after the cut too, but a
+    # closed receipt's byte count is final -- those extra bytes belong
+    # to whatever receipt comes after, not this one.
+    receipts = split_into_receipts(ops, byte_offsets=[10, 13], total_bytes=50)
+
+    assert len(receipts) == 1
+    assert receipts[0].byte_count == 13
+
+
+def test_total_bytes_only_tops_up_when_it_exceeds_the_last_known_offset():
+    ops = [_text("A")]
+    # total_bytes equal to (or, defensively, less than) the last known
+    # op offset must never shrink the byte count.
+    receipts = split_into_receipts(ops, byte_offsets=[20], total_bytes=20)
+
+    assert receipts[0].byte_count == 20
+
+
+def test_total_bytes_yields_a_placeholder_receipt_when_no_op_has_completed_yet():
+    # Bytes have been received (e.g. the first chunk of a print landed
+    # entirely inside a still-incomplete command), but the parser has
+    # not produced a single op yet. Those bytes must still be
+    # represented somewhere instead of silently vanishing until the
+    # first op finally completes.
+    receipts = split_into_receipts([], byte_offsets=[], total_bytes=30)
+
+    assert len(receipts) == 1
+    assert receipts[0].ops == ()
+    assert receipts[0].byte_count == 30
+
+
+def test_total_bytes_yields_no_placeholder_receipt_when_nothing_has_arrived():
+    receipts = split_into_receipts([], byte_offsets=[], total_bytes=0)
+
+    assert receipts == []

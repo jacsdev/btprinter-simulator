@@ -913,3 +913,97 @@ def test_status_updates_correctly_via_real_tcp_port_when_log_level_is_warning():
     assert viewer.statuses[-1].connection_state in ("connected", "disconnected", "stopped")
     connected_statuses = [s for s in viewer.statuses if s.connection_state == "connected"]
     assert connected_statuses, "status store never reached the 'connected' state"
+
+
+# -- on_data byte accounting: a chunk that completes no op must still
+# reach the Viewer (regression for the "29293 bytes received / 17005
+# bytes in session history" bug) ----------------------------------------
+
+
+def test_on_data_calls_update_ops_even_for_a_chunk_that_completes_no_op(monkeypatch):
+    # on_data used to call viewer.update_ops() only `if ops:`, so a live
+    # chunk landing entirely inside a still-incomplete command (e.g. a
+    # raster image band split across more than one network read) never
+    # reached the Viewer at all -- silently dropping that chunk's bytes
+    # from the Viewer's own accounting while status_store.add_bytes()
+    # kept counting them, so the status bar and the session history
+    # panel could never be reconciled again.
+    class _FakePort:
+        def __init__(self):
+            self.on_data = None
+
+        def set_connection_listener(self, listener):
+            pass
+
+        def start(self, on_data):
+            self.on_data = on_data
+
+        def stop(self):
+            pass
+
+    fake_port = _FakePort()
+    monkeypatch.setattr(main, "build_transport", lambda *a, **k: fake_port)
+
+    update_ops_calls = []
+    captured = {}
+
+    class _FakeViewer:
+        def __init__(self, *a, **kw):
+            self.status = kw.get("status")
+            captured["viewer"] = self
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            update_ops_calls.append((list(ops), chunk_bytes, byte_offsets))
+
+        def add_diagnostics(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeViewer)
+
+    main.run(["--transport", "tcp", "--port", "9100"])
+    viewer = captured["viewer"]
+
+    # A GS V (cut) command split across two chunks: the first byte alone
+    # (0x1D) completes no op at all.
+    fake_port.on_data(bytes([0x1D]))
+    fake_port.on_data(bytes([0x56, 0x00]))
+
+    assert len(update_ops_calls) == 2
+    first_ops, first_chunk_bytes, first_offsets = update_ops_calls[0]
+    assert first_ops == []
+    assert first_chunk_bytes == 1
+    assert first_offsets == []
+
+    second_ops, second_chunk_bytes, second_offsets = update_ops_calls[1]
+    assert len(second_ops) == 1
+    assert second_chunk_bytes == 2
+    assert second_offsets == [2]
+
+    # The status bar's byte counter and every chunk handed to update_ops
+    # must reconcile: it counted both chunks, update_ops saw both too.
+    assert viewer.status.bytes_received == 1 + 2
+    assert sum(chunk_bytes for _, chunk_bytes, _ in update_ops_calls) == viewer.status.bytes_received

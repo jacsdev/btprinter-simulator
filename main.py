@@ -504,8 +504,17 @@ def run(argv: list[str] | None = None) -> None:
         # Tkinter is not thread-safe: hop back onto the main/UI thread
         # before touching any widget from the transport's background
         # accept/read thread.
-        if ops:
-            viewer.call_soon(viewer.update_ops, ops, len(chunk), byte_offsets)
+        #
+        # update_ops() is called for *every* chunk, even one that
+        # completes no op at all (the parser is still buffering a
+        # partial op, e.g. a raster image band split across more than
+        # one network read). Gating this behind `if ops:` used to let
+        # such a chunk's bytes vanish from the Viewer's own accounting
+        # while status_store.add_bytes() above kept counting them --
+        # the status bar and the session history panel could then never
+        # be reconciled (see render.viewer.Viewer.update_ops()'s
+        # docstring for the invariant this restores).
+        viewer.call_soon(viewer.update_ops, ops, len(chunk), byte_offsets)
         if diagnostics:
             viewer.call_soon(viewer.add_diagnostics, diagnostics)
 

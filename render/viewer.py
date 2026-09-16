@@ -427,6 +427,20 @@ class Viewer:
         chunk never spans more than one receipt. It defaults to 0/`None`
         so existing/simple callers that only care about the rendering
         pipeline are unaffected.
+
+        A chunk that produces no ops at all (`ops == []`) -- e.g. the
+        parser is still buffering a partial op, such as a raster image
+        band split across more than one network read -- must still be
+        accounted for: `chunk_bytes` is always added to the running byte
+        total even when `ops` is empty, and that running total is passed
+        to `split_into_receipts()` as `total_bytes` so the trailing,
+        not-yet-cut receipt in the session history panel is topped up to
+        match it. A caller that only invoked `update_ops()` when `ops`
+        was non-empty would silently drop that chunk's bytes from the
+        Viewer's own accounting while any separately maintained
+        status-bar counter kept counting them -- two numbers that could
+        never be reconciled again. Always call this once per chunk,
+        empty or not.
         """
         was_at_bottom = is_scrolled_to_bottom(self._canvas.yview())
 
@@ -440,14 +454,22 @@ class Viewer:
         else:
             self._bytes_total += chunk_bytes
             self._op_byte_offsets.extend([self._bytes_total] * len(ops))
-        self._receipts = split_into_receipts(self._ops, byte_offsets=self._op_byte_offsets)
+        self._receipts = split_into_receipts(
+            self._ops, byte_offsets=self._op_byte_offsets, total_bytes=self._bytes_total
+        )
+        self._refresh_history_panel()
+
+        if not ops:
+            # Byte accounting and the history panel's trailing-receipt
+            # label are already up to date; there is nothing new to
+            # render, so skip rebuilding the (unchanged) receipt image.
+            return
 
         image, offsets = self._build_combined_image()
         self._current_image = image
         self._receipt_offsets = offsets
 
         self._refresh_body()
-        self._refresh_history_panel()
 
         if should_autoscroll_on_new_content(was_at_bottom):
             self._canvas.yview_moveto(1.0)

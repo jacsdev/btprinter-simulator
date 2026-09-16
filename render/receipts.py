@@ -36,6 +36,7 @@ def split_into_receipts(
     *,
     start_sequence: int = 1,
     byte_offsets: Optional[Sequence[int]] = None,
+    total_bytes: Optional[int] = None,
     now: Optional[Callable[[], datetime]] = None,
 ) -> List[Receipt]:
     """Group `ops` into `Receipt`s, splitting at each `CutOp` boundary.
@@ -52,6 +53,23 @@ def split_into_receipts(
     without it, `byte_count` is left as `None` -- this function only
     knows about ops, never about the raw byte stream that produced
     them.
+
+    `total_bytes`, if given alongside `byte_offsets`, is the total
+    number of raw bytes received so far. It can be larger than
+    `byte_offsets[-1]` whenever the caller is still buffering a partial
+    op it has not finished decoding yet (e.g. a raster image band split
+    across more than one network chunk) -- bytes that were physically
+    received but do not yet belong to any completed op. When supplied,
+    the *trailing* receipt -- the one still open, not yet terminated by
+    a cut -- is credited with every byte received so far instead of
+    just the bytes accounted for by a completed op, so a chunk that
+    completes no new op still shows up in the session history instead
+    of silently vanishing from it. A closed receipt (one ending in a
+    `CutOp`) is never affected: once a cut has been received, its byte
+    count is exact and final. If there are no ops at all yet but
+    `total_bytes` is positive, a single placeholder receipt (no ops,
+    `byte_count=total_bytes`) is returned instead of an empty list, so
+    bytes already received are never silently unrepresented.
     """
     if byte_offsets is not None and len(byte_offsets) != len(ops):
         raise ValueError("byte_offsets must be the same length as ops")
@@ -63,14 +81,17 @@ def split_into_receipts(
     current_ops: List[object] = []
     current_start_index = 0
 
-    def close_receipt(end_index: int) -> None:
+    def close_receipt(end_index: int, *, is_trailing_open_receipt: bool = False) -> None:
         nonlocal sequence, current_ops, current_start_index
         if not current_ops:
             return
         byte_count = None
         if byte_offsets is not None:
             start_offset = byte_offsets[current_start_index - 1] if current_start_index > 0 else 0
-            byte_count = byte_offsets[end_index] - start_offset
+            end_offset = byte_offsets[end_index]
+            if is_trailing_open_receipt and total_bytes is not None and total_bytes > end_offset:
+                end_offset = total_bytes
+            byte_count = end_offset - start_offset
         receipts.append(
             Receipt(
                 sequence=sequence,
@@ -88,6 +109,11 @@ def split_into_receipts(
         if isinstance(op, CutOp):
             close_receipt(index)
 
-    close_receipt(len(ops) - 1)
+    close_receipt(len(ops) - 1, is_trailing_open_receipt=True)
+
+    if not receipts and total_bytes:
+        receipts.append(
+            Receipt(sequence=sequence, timestamp=timestamp_factory(), ops=(), byte_count=total_bytes)
+        )
 
     return receipts

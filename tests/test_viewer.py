@@ -9,14 +9,18 @@ session. See tools/send_sample.py + main.py for the interactive path.
 
 import os
 import tkinter as tk
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from core.diagnostics import Diagnostic
 from core.ops import CutOp, LineFeedOp, TextOp
+from core.parser import Parser
 from core.state import PrinterState
 from render.viewer import DEFAULT_GEOMETRY, TransportStatus, Viewer
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("BTPRINTER_SKIP_GUI_TESTS") == "1",
@@ -297,6 +301,127 @@ def test_viewer_update_ops_rejects_mismatched_byte_offsets_length(tk_root):
             viewer.update_ops([TextOp(text="A", style=PrinterState())], chunk_bytes=1, byte_offsets=[1, 2])
     finally:
         viewer.destroy()
+
+
+def test_viewer_update_ops_with_no_new_ops_still_advances_the_byte_total(tk_root):
+    # Regression for the exact defect behind the "29293 bytes received /
+    # 17005 bytes in session history" bug: a chunk that completes no op
+    # at all (the parser is still buffering a partial op) must still be
+    # reflected in the session history's byte total once it is fed to
+    # update_ops(), not silently dropped.
+    viewer = _make_viewer(tk_root)
+    try:
+        viewer.update_ops([TextOp(text="A", style=PrinterState())], chunk_bytes=1, byte_offsets=[1])
+        # A chunk that landed entirely inside a still-incomplete command:
+        # zero ops, but the bytes were physically received.
+        viewer.update_ops([], chunk_bytes=5, byte_offsets=[])
+
+        receipts = viewer.get_receipts()
+        assert len(receipts) == 1
+        assert receipts[0].byte_count == 6
+    finally:
+        viewer.destroy()
+
+
+# -- byte-accounting invariant: session history must always reconcile
+# with the status bar's "Bytes received" (see render.viewer.Viewer.
+# update_ops()'s docstring and render.receipts.split_into_receipts()'s
+# `total_bytes` parameter) -----------------------------------------------
+
+
+def _drive_and_assert_reconciled(viewer: Viewer, data: bytes, chunk_size: int) -> None:
+    """Feed `data` through a fresh `Parser` in `chunk_size` pieces,
+    mirroring main.py's on_data callback: every chunk, even one that
+    completes no op, both advances a status-bar-style running byte
+    counter and is passed to `viewer.update_ops()`. After every single
+    chunk, the sum of the session history's byte counts (which already
+    includes the trailing, not-yet-cut receipt) must equal that counter.
+    """
+    parser = Parser()
+    status_bytes = 0
+    for start in range(0, len(data), chunk_size):
+        chunk = data[start : start + chunk_size]
+        ops = parser.feed(chunk)
+        byte_offsets = parser.take_op_offsets()
+        status_bytes += len(chunk)
+
+        viewer.update_ops(ops, len(chunk), byte_offsets)
+
+        history_total = sum(r.byte_count for r in viewer.get_receipts())
+        assert history_total == status_bytes, (
+            f"history total {history_total} != status bar bytes {status_bytes} "
+            f"after {start + len(chunk)} of {len(data)} bytes (chunk_size={chunk_size})"
+        )
+
+
+def test_viewer_reconciles_history_total_with_status_bar_bytes_for_ping_pong_capture(tk_root):
+    data = (FIXTURES_DIR / "ping-pong.bin").read_bytes()
+
+    for chunk_size in (len(data), 4096, 1024, 512, 128, 1):
+        viewer = Viewer(width_dots=384, master=tk_root)
+        try:
+            _drive_and_assert_reconciled(viewer, data, chunk_size)
+
+            # The capture has exactly one CutOp, at the very end, so it
+            # always yields a single, fully-closed receipt covering every
+            # byte -- regardless of chunk size. (The *number* of ops that
+            # single receipt holds can vary slightly at very small chunk
+            # sizes: the parser flushes a text run at the end of whatever
+            # chunk it arrived in, so a tiny chunk can split one text run
+            # into two TextOps -- a documented parser behavior, not a
+            # byte-accounting one, and not what this test is about.)
+            receipts = viewer.get_receipts()
+            assert len(receipts) == 1
+            assert receipts[0].byte_count == len(data)
+            if chunk_size >= 512:
+                assert sum(len(r.ops) for r in receipts) == 88
+        finally:
+            viewer.destroy()
+
+
+def test_viewer_same_input_produces_the_same_per_receipt_byte_counts_whole_or_chunked(tk_root):
+    data = (FIXTURES_DIR / "ping-pong.bin").read_bytes()
+
+    def byte_counts_for(chunk_size: int) -> list:
+        viewer = Viewer(width_dots=384, master=tk_root)
+        try:
+            _drive_and_assert_reconciled(viewer, data, chunk_size)
+            return [r.byte_count for r in viewer.get_receipts()]
+        finally:
+            viewer.destroy()
+
+    whole = byte_counts_for(len(data))
+    chunked_4096 = byte_counts_for(4096)
+    chunked_1024 = byte_counts_for(1024)
+    chunked_128 = byte_counts_for(128)
+
+    assert whole == chunked_4096 == chunked_1024 == chunked_128 == [len(data)]
+
+
+def test_viewer_reconciles_a_stream_with_multiple_cuts(tk_root):
+    # Three receipts: two closed by a cut, one left genuinely open (never
+    # cut), plus a command deliberately split across a chunk boundary
+    # (the lone trailing 0x1D) so a chunk that completes no op at all is
+    # exercised too.
+    data = (
+        b"FIRST\x0a"
+        + bytes([0x1D, 0x56, 0x00])  # GS V 0 -- full cut
+        + b"SECOND\x0a"
+        + bytes([0x1D, 0x56, 0x01])  # GS V 1 -- partial cut
+        + b"THIRD"
+        + bytes([0x1D])  # incomplete cut command -- never finishes
+    )
+
+    for chunk_size in (1, 2, 3, 7, len(data)):
+        viewer = Viewer(width_dots=384, master=tk_root)
+        try:
+            _drive_and_assert_reconciled(viewer, data, chunk_size)
+
+            receipts = viewer.get_receipts()
+            assert len(receipts) == 3
+            assert sum(r.byte_count for r in receipts) == len(data)
+        finally:
+            viewer.destroy()
 
 
 def test_viewer_scroll_to_receipt_moves_the_canvas_view(tk_root, monkeypatch):

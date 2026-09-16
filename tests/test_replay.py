@@ -9,9 +9,15 @@ instead of silently discarding them (the original defect: replaying a
 capture with unknown commands showed "No unknown commands").
 """
 
+from pathlib import Path
+
+from core.ops import BitImageOp, CutOp, RasterImageOp
 from core.parser import Parser
 from main import _make_byte_dumper, replay_file
+from render.receipts import split_into_receipts
 from tools.send_sample import build_sample_ticket
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def test_replaying_a_dumped_capture_reproduces_the_original_live_ops(tmp_path):
@@ -147,3 +153,32 @@ def test_replay_file_byte_offsets_match_ops_length_and_sum_to_total_bytes(tmp_pa
     assert len(receipts) == 2
     assert sum(r.byte_count for r in receipts) == len(capture)
     assert all(r.byte_count != 0 for r in receipts)
+
+
+# -- ping-pong.bin: a real, complex 29,293-byte capture from the target
+# Flutter app (both image encodings, print-position commands, styles, a
+# cut) kept as a permanent regression fixture. Contains no personal
+# data -- generic text and a ping-pong graphic. Regression for the
+# "29293 bytes received / 17005 bytes in session history" bug: replaying
+# it must account for every one of its bytes. ---------------------------
+
+
+def test_ping_pong_fixture_replays_with_zero_diagnostics_and_exact_byte_accounting():
+    path = FIXTURES_DIR / "ping-pong.bin"
+    data = path.read_bytes()
+    assert len(data) == 29293
+
+    result = replay_file(str(path))
+
+    assert len(result.ops) == 88
+    assert result.diagnostics == []
+    assert len(result.byte_offsets) == len(result.ops)
+    assert result.byte_offsets[-1] == len(data)
+
+    assert sum(1 for op in result.ops if isinstance(op, BitImageOp)) == 13
+    assert sum(1 for op in result.ops if isinstance(op, RasterImageOp)) == 1
+    assert sum(1 for op in result.ops if isinstance(op, CutOp)) == 1
+
+    receipts = split_into_receipts(result.ops, byte_offsets=result.byte_offsets, total_bytes=len(data))
+    assert len(receipts) == 1
+    assert receipts[0].byte_count == len(data)

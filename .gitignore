@@ -34,6 +34,9 @@ Thumbs.db
 # names and document numbers. Never commit a capture taken from real data.
 # A sanitised fixture may be added deliberately with `git add -f`.
 *.bin
+# ...except vetted regression fixtures under tests/fixtures/, which contain
+# no personal data and are meant to be tracked (see tests/fixtures/ping-pong.bin).
+!tests/fixtures/*.bin
 
 # Rendered output
 *.png
