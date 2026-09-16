@@ -37,6 +37,12 @@ Thumbs.db
 
 # Rendered output
 *.png
+# ...except documentation screenshots, which belong in the repo
+!docs/*.png
 
 # Local agent instructions (not part of the project)
 CLAUDE.md
+
+# Windows/Git Bash artifact: `> nul` in a POSIX shell creates a literal file
+# named "nul" instead of writing to the Windows null device.
+nul
