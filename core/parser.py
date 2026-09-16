@@ -373,6 +373,12 @@ class Parser:
         if cmd == 0x2A:  # ESC * m nL nH d... - column bit image
             return self._parse_bit_image(buf)
 
+        if cmd == 0x24:  # ESC $ nL nH - set absolute horizontal print position
+            return self._need_word(buf, lambda pos: setattr(self.state, "h_pos_dots", pos))
+
+        if cmd == 0x5C:  # ESC \ nL nH - set relative horizontal print position (signed)
+            return self._need_word(buf, self._apply_relative_h_pos)
+
         return self._skip_unknown(buf, 2)
 
     def _need(self, buf: bytes, total: int, apply) -> Optional[Tuple[int, List[object]]]:
@@ -383,6 +389,24 @@ class Parser:
         n = buf[total - 1]
         apply(n)
         return total, [StyleChangeOp(style=self.state.snapshot())]
+
+    def _need_word(self, buf: bytes, apply) -> Optional[Tuple[int, List[object]]]:
+        """Helper for `ESC/GS x nL nH`-shaped commands: read a little-endian
+        16-bit word (nL + nH * 256), apply it, and emit a StyleChangeOp
+        with the resulting state snapshot."""
+        if len(buf) < 4:
+            return _NEED_MORE
+        nl, nh = buf[2], buf[3]
+        apply(nl + nh * 256)
+        return 4, [StyleChangeOp(style=self.state.snapshot())]
+
+    def _apply_relative_h_pos(self, raw: int) -> None:
+        """ESC \\'s argument is a signed 16-bit two's complement value: a
+        raw word of 0x8000-0xFFFF represents a negative delta (move
+        left). The resulting position is clamped at 0 -- a real print
+        head cannot move left of the left margin."""
+        delta = raw - 0x10000 if raw >= 0x8000 else raw
+        self.state.h_pos_dots = max(0, self.state.h_pos_dots + delta)
 
     def _set_align(self, n: int) -> None:
         self.state.align = {0: "left", 1: "center", 2: "right"}.get(n, "left")
@@ -435,7 +459,10 @@ class Parser:
             return _NEED_MORE
         data = buf[5:total]
         height = bytes_per_column * 8
-        return total, [BitImageOp(mode=mode, width=columns, height=height, data=data)]
+        x_offset = self.state.left_margin_dots + self.state.h_pos_dots
+        return total, [
+            BitImageOp(mode=mode, width=columns, height=height, data=data, x_offset=x_offset)
+        ]
 
     # -- GS commands ------------------------------------------------------
 
@@ -475,6 +502,14 @@ class Parser:
 
         if cmd == 0x28:  # GS ( k - QR code (and other "( k" functions)
             return self._parse_gs_paren_k(buf)
+
+        if cmd == 0x4C:  # GS L nL nH - set left margin
+            return self._need_word(buf, lambda n: setattr(self.state, "left_margin_dots", n))
+
+        if cmd == 0x57:  # GS W nL nH - set printing area width
+            return self._need_word(
+                buf, lambda n: setattr(self.state, "print_area_width_dots", n)
+            )
 
         return self._skip_unknown(buf, 2)
 
@@ -519,7 +554,10 @@ class Parser:
         if len(buf) < total:
             return _NEED_MORE
         data = buf[8:total]
-        return total, [RasterImageOp(width=width_bytes * 8, height=height, data=data)]
+        x_offset = self.state.left_margin_dots + self.state.h_pos_dots
+        return total, [
+            RasterImageOp(width=width_bytes * 8, height=height, data=data, x_offset=x_offset)
+        ]
 
     def _parse_barcode(self, buf: bytes) -> Optional[Tuple[int, List[object]]]:
         if len(buf) < 3:

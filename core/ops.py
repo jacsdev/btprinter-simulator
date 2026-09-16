@@ -93,6 +93,9 @@ class BitImageOp:
     width: int  # dot columns
     height: int  # dots per column (8 or 24 depending on mode)
     data: bytes
+    # Horizontal print position (left_margin_dots + h_pos_dots) active when
+    # this op was parsed -- see ESC $ / ESC \ / GS L in core/state.py.
+    x_offset: int = 0
 
 
 @dataclass
@@ -102,6 +105,9 @@ class RasterImageOp:
     width: int  # pixels
     height: int  # pixels
     data: bytes  # row-major, 1 bit per pixel, MSB first, padded to a byte
+    # Horizontal print position (left_margin_dots + h_pos_dots) active when
+    # this op was parsed -- see ESC $ / ESC \ / GS L in core/state.py.
+    x_offset: int = 0
 
 
 @dataclass

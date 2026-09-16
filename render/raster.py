@@ -214,6 +214,20 @@ class ReceiptRenderer:
 
     # -- text -----------------------------------------------------------
 
+    def _usable_width_dots(self, style: PrinterState) -> int:
+        """Return the printable width in dots, honoring GS L (left margin)
+        and GS W (printing area width).
+
+        When GS W has not been set, the printable area is assumed to
+        extend from the left margin to the paper's right edge -- there is
+        no observed byte capture pinning this default, so it is inferred
+        directly from the Epson ESC/POS command reference's description
+        of GS L/GS W rather than measured on physical paper.
+        """
+        if style.print_area_width_dots is not None:
+            return max(style.print_area_width_dots, 1)
+        return max(self.width_dots - style.left_margin_dots, 1)
+
     def _render_text_line(self, runs: List[TextOp]) -> Image.Image:
         style = runs[-1].style if runs else PrinterState()
         width_mult = max(style.width_mult, 1)
@@ -227,16 +241,25 @@ class ReceiptRenderer:
         # losing it (measured on paper -- see tests/test_raster_wrap.py).
         # Double-width text consumes 2 cells/char, so the limit shrinks by
         # `width_mult`; reuse `chars_per_line` rather than duplicating the
-        # per-font dot metrics.
-        max_chars = chars_per_line(self.width_dots, style.font) // width_mult
+        # per-font dot metrics. The usable width (not necessarily the full
+        # paper width) is what GS L/GS W actually constrain.
+        usable_width = self._usable_width_dots(style)
+        max_chars = chars_per_line(usable_width, style.font) // width_mult
         chunks = wrap_text_hard(text, max_chars)
 
         # Each wrapped chunk becomes its own physical line, at the same
         # height as (and inheriting the alignment of) the line it
-        # continues from.
+        # continues from. ESC $/ESC \\ set the print *start* position, so
+        # (per the Epson reference: "effective only ... at the beginning
+        # of a line") only the first physical chunk is offset by it --
+        # wrapped continuation lines resume at the left margin, exactly
+        # like a fresh line would. This is inferred from that documented
+        # scope note, not from a captured multi-line ESC $ + wrap sample.
         chunk_lines = [
-            self._render_text_chunk(chunk, style, font, width_mult, height_mult)
-            for chunk in chunks
+            self._render_text_chunk(
+                chunk, style, font, width_mult, height_mult, usable_width, apply_h_pos=(i == 0)
+            )
+            for i, chunk in enumerate(chunks)
         ]
 
         total_height = sum(chunk_line.height for chunk_line in chunk_lines) or 1
@@ -254,6 +277,8 @@ class ReceiptRenderer:
         font: ImageFont.ImageFont,
         width_mult: int,
         height_mult: int,
+        usable_width: int,
+        apply_h_pos: bool,
     ) -> Image.Image:
         """Render one already-wrapped chunk as a single physical line."""
         cell_width, cell_height = FONT_METRICS.get(style.font, FONT_METRICS["A"])
@@ -289,12 +314,22 @@ class ReceiptRenderer:
             "L", (self.width_dots, line_height), color=_BACKGROUND if not style.reverse else _FOREGROUND
         )
 
+        # Center/right alignment justifies the whole line within the
+        # printable area (left margin .. left margin + usable_width);
+        # left-aligned (the default) content starts at the print position
+        # set by ESC $/ESC \\ -- combining an explicit position with
+        # center/right alignment is not a case seen in any captured
+        # sample, so alignment is treated as authoritative over h_pos_dots
+        # when both are in play, matching how align already overrides a
+        # plain left start.
+        left_edge = style.left_margin_dots
         if style.align == "center":
-            x = max((self.width_dots - scaled.width) // 2, 0)
+            x = left_edge + max((usable_width - scaled.width) // 2, 0)
         elif style.align == "right":
-            x = max(self.width_dots - scaled.width, 0)
+            x = left_edge + max(usable_width - scaled.width, 0)
         else:
-            x = 0
+            x = left_edge + (style.h_pos_dots if apply_h_pos else 0)
+        x = max(min(x, max(self.width_dots - scaled.width, 0)), 0)
 
         line.paste(scaled, (x, 0))
         return line
@@ -317,7 +352,8 @@ class ReceiptRenderer:
                 if row_data[byte_index] & (1 << bit):
                     pixels[col, row] = 0  # black
         canvas = Image.new("L", (self.width_dots, height), color=_BACKGROUND)
-        canvas.paste(image.convert("L"), (0, 0))
+        x = max(min(op.x_offset, max(self.width_dots - width, 0)), 0)
+        canvas.paste(image.convert("L"), (x, 0))
         return canvas
 
     def _render_bit_image(self, op: BitImageOp) -> Image.Image:
@@ -338,7 +374,8 @@ class ReceiptRenderer:
                         if y < height:
                             pixels[col, y] = 0
         canvas = Image.new("L", (self.width_dots, height), color=_BACKGROUND)
-        canvas.paste(image.convert("L"), (0, 0))
+        x = max(min(op.x_offset, max(self.width_dots - width, 0)), 0)
+        canvas.paste(image.convert("L"), (x, 0))
         return canvas
 
     # -- placeholders / markers ------------------------------------------

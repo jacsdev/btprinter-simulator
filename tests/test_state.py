@@ -19,6 +19,9 @@ def test_default_state_has_expected_power_on_values():
     assert state.code_table == 0
     assert state.charset == 0
     assert isinstance(state.barcode, BarcodeConfig)
+    assert state.h_pos_dots == 0
+    assert state.left_margin_dots == 0
+    assert state.print_area_width_dots is None
 
 
 def test_reset_restores_power_on_defaults_after_mutation():
@@ -36,6 +39,9 @@ def test_reset_restores_power_on_defaults_after_mutation():
     state.code_table = 5
     state.charset = 2
     state.barcode.height = 200
+    state.h_pos_dots = 100
+    state.left_margin_dots = 20
+    state.print_area_width_dots = 300
 
     state.reset()
 

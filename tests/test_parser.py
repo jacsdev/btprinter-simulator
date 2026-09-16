@@ -346,6 +346,202 @@ def test_esc_star_double_density_bit_image():
 
 
 # ---------------------------------------------------------------------------
+# ESC $ / ESC \ - horizontal print position (absolute / relative)
+# GS L / GS W - left margin / printing area width
+#
+# Diagnosed from a real Flutter print job (esc_pos_utils_plus): the parser
+# did not know ESC $, so "1b 24 00 00" produced 3 diagnostics each time it
+# appeared (the ESC $ pair itself, plus each of its 2 argument bytes
+# falling through as unrecognized bytes of their own). 9 occurrences in the
+# real capture x 3 diagnostics = exactly the 27 warnings observed.
+# ---------------------------------------------------------------------------
+
+
+def test_esc_dollar_zero_position_yields_zero_diagnostics_the_real_log_regression():
+    parser = make_parser()
+
+    ops = parser.feed(bytes([0x1B, 0x24, 0x00, 0x00]) + b"OK\x0a")
+
+    assert parser.take_diagnostics() == []
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.text == "OK"
+
+
+def test_esc_dollar_nine_times_interleaved_with_text_yields_zero_diagnostics():
+    # Replays the exact repeating pattern from the real capture: ESC $ 00 00
+    # interleaved with text, 9 times.
+    parser = make_parser()
+
+    for i in range(9):
+        parser.feed(bytes([0x1B, 0x24, 0x00, 0x00]))
+        parser.feed(f"line {i}\x0a".encode("ascii"))
+
+    assert parser.take_diagnostics() == []
+
+
+def test_esc_dollar_sets_absolute_horizontal_position():
+    parser = make_parser()
+
+    ops = parser.feed(bytes([0x1B, 0x24, 100, 0]))
+
+    assert parser.state.h_pos_dots == 100
+    assert ops == [StyleChangeOp(style=parser.state.snapshot())]
+
+
+def test_esc_dollar_position_uses_little_endian_two_byte_word():
+    parser = make_parser()
+
+    parser.feed(bytes([0x1B, 0x24, 0x2C, 0x01]))  # 0x012C = 300
+
+    assert parser.state.h_pos_dots == 300
+
+
+def test_esc_dollar_split_across_two_feed_calls():
+    parser = make_parser()
+    command = bytes([0x1B, 0x24, 100, 0])
+
+    ops1 = parser.feed(command[:2])
+    assert ops1 == []
+    ops2 = parser.feed(command[2:3])
+    assert ops2 == []
+    ops3 = parser.feed(command[3:])
+
+    assert parser.state.h_pos_dots == 100
+    assert len(ops3) == 1
+
+
+def test_esc_backslash_moves_position_right_with_positive_delta():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x24, 50, 0]))  # start at 50
+
+    parser.feed(bytes([0x1B, 0x5C, 20, 0]))  # +20
+
+    assert parser.state.h_pos_dots == 70
+
+
+def test_esc_backslash_negative_two_s_complement_moves_left():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x24, 50, 0]))  # start at 50
+
+    # -20 as a signed 16-bit two's complement word: 0xFFEC = 65516
+    raw = (-20) & 0xFFFF
+    nl, nh = raw & 0xFF, (raw >> 8) & 0xFF
+    parser.feed(bytes([0x1B, 0x5C, nl, nh]))
+
+    assert parser.state.h_pos_dots == 30
+
+
+def test_esc_backslash_negative_delta_clamps_at_zero():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x24, 10, 0]))  # start at 10
+
+    raw = (-100) & 0xFFFF
+    nl, nh = raw & 0xFF, (raw >> 8) & 0xFF
+    parser.feed(bytes([0x1B, 0x5C, nl, nh]))
+
+    assert parser.state.h_pos_dots == 0
+
+
+def test_esc_backslash_split_across_two_feed_calls():
+    parser = make_parser()
+    command = bytes([0x1B, 0x5C, 20, 0])
+
+    ops1 = parser.feed(command[:1])
+    assert ops1 == []
+    ops2 = parser.feed(command[1:3])
+    assert ops2 == []
+    ops3 = parser.feed(command[3:])
+
+    assert parser.state.h_pos_dots == 20
+    assert len(ops3) == 1
+
+
+def test_esc_at_resets_print_position_family_to_defaults():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x24, 100, 0]))  # h_pos
+    parser.feed(bytes([0x1D, 0x4C, 10, 0]))  # left margin
+    parser.feed(bytes([0x1D, 0x57, 200, 0]))  # print area width
+    assert parser.state.h_pos_dots == 100
+    assert parser.state.left_margin_dots == 10
+    assert parser.state.print_area_width_dots == 200
+
+    parser.feed(bytes([0x1B, 0x40]))
+
+    assert parser.state.h_pos_dots == 0
+    assert parser.state.left_margin_dots == 0
+    assert parser.state.print_area_width_dots is None
+
+
+def test_gs_l_sets_left_margin():
+    parser = make_parser()
+
+    ops = parser.feed(bytes([0x1D, 0x4C, 24, 0]))
+
+    assert parser.state.left_margin_dots == 24
+    assert ops == [StyleChangeOp(style=parser.state.snapshot())]
+
+
+def test_gs_l_split_across_two_feed_calls():
+    parser = make_parser()
+    command = bytes([0x1D, 0x4C, 24, 0])
+
+    ops1 = parser.feed(command[:2])
+    assert ops1 == []
+    ops2 = parser.feed(command[2:])
+
+    assert parser.state.left_margin_dots == 24
+    assert len(ops2) == 1
+
+
+def test_gs_w_sets_printing_area_width():
+    parser = make_parser()
+
+    ops = parser.feed(bytes([0x1D, 0x57, 0x90, 0x01]))  # 0x0190 = 400
+
+    assert parser.state.print_area_width_dots == 400
+    assert ops == [StyleChangeOp(style=parser.state.snapshot())]
+
+
+def test_gs_w_split_across_two_feed_calls():
+    parser = make_parser()
+    command = bytes([0x1D, 0x57, 0x90, 0x01])
+
+    ops1 = parser.feed(command[:3])
+    assert ops1 == []
+    ops2 = parser.feed(command[3:])
+
+    assert parser.state.print_area_width_dots == 400
+    assert len(ops2) == 1
+
+
+def test_raster_image_captures_x_offset_from_left_margin_and_h_pos():
+    parser = make_parser()
+    parser.feed(bytes([0x1D, 0x4C, 10, 0]))  # left margin = 10
+    parser.feed(bytes([0x1B, 0x24, 5, 0]))  # h_pos = 5
+    width_bytes = 1
+    height = 1
+    data = bytes([0xFF])
+    header = bytes([0x1D, 0x76, 0x30, 0, width_bytes, 0, height, 0])
+
+    ops = parser.feed(header + data)
+
+    raster_op = next(op for op in ops if isinstance(op, RasterImageOp))
+    assert raster_op.x_offset == 15
+
+
+def test_bit_image_captures_x_offset_from_left_margin_and_h_pos():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x24, 30, 0]))  # h_pos = 30
+    columns = 1
+    data = bytes([0xFF])
+
+    ops = parser.feed(bytes([0x1B, 0x2A, 0, columns, 0]) + data)
+
+    bit_image_op = next(op for op in ops if isinstance(op, BitImageOp))
+    assert bit_image_op.x_offset == 30
+
+
+# ---------------------------------------------------------------------------
 # GS ! - character size multipliers
 # ---------------------------------------------------------------------------
 

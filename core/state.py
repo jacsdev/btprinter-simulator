@@ -41,6 +41,14 @@ class PrinterState:
     charset: int = 0
     kanji_mode: bool = False  # set by FS & / FS .; Kanji rendering itself is out of scope
     barcode: BarcodeConfig = field(default_factory=BarcodeConfig)
+    # Print-position family (ESC $, ESC \, GS L, GS W). All four are dot
+    # measurements and all four persist across lines -- like every other
+    # field on this class -- until explicitly changed again or reset by
+    # ESC @, matching the documented Epson ESC/POS behavior for these
+    # commands.
+    h_pos_dots: int = 0  # ESC $ (absolute) / ESC \ (relative): dots from left_margin_dots
+    left_margin_dots: int = 0  # GS L: left margin, dots from the physical paper edge
+    print_area_width_dots: Optional[int] = None  # GS W: printing area width, dots; None = full paper width minus the left margin
 
     def reset(self) -> None:
         """Restore power-on defaults, as triggered by ESC @ (initialize)."""
@@ -59,6 +67,9 @@ class PrinterState:
         self.charset = default.charset
         self.kanji_mode = default.kanji_mode
         self.barcode = default.barcode
+        self.h_pos_dots = default.h_pos_dots
+        self.left_margin_dots = default.left_margin_dots
+        self.print_area_width_dots = default.print_area_width_dots
 
     def snapshot(self) -> "PrinterState":
         """Return a deep, independent copy to tag onto a render op."""
