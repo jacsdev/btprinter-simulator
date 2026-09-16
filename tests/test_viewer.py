@@ -588,11 +588,18 @@ def test_viewer_requests_default_geometry_on_init(tk_root):
         viewer.destroy()
 
 
-def test_viewer_geometry_does_not_change_for_a_long_receipt(tk_root):
+def test_viewer_geometry_does_not_change_for_a_long_receipt(tk_root, monkeypatch):
+    # Assert on what the viewer REQUESTS, not on what Tk reports back. The
+    # shared root is withdrawn and other tests in this module create viewers
+    # on it, so reading tk_root.geometry() depends on window mapping and on
+    # test order -- which made this test fail intermittently. Same approach as
+    # test_viewer_never_calls_minsize below.
+    calls = []
+    monkeypatch.setattr(tk_root, "geometry", lambda *a, **k: calls.append((a, k)))
+
     viewer = _make_viewer(tk_root)
     try:
-        tk_root.update_idletasks()
-        before = tk_root.geometry().split("+")[0]
+        assert calls == [((DEFAULT_GEOMETRY,), {})]
 
         many_ops = []
         for i in range(500):
@@ -600,11 +607,8 @@ def test_viewer_geometry_does_not_change_for_a_long_receipt(tk_root):
             many_ops.append(LineFeedOp())
         viewer.update_ops(many_ops)
 
-        tk_root.update_idletasks()
-        after = tk_root.geometry().split("+")[0]
-
-        assert before == DEFAULT_GEOMETRY
-        assert after == DEFAULT_GEOMETRY
+        # A long receipt must scroll inside the window, never resize it.
+        assert calls == [((DEFAULT_GEOMETRY,), {})]
     finally:
         viewer.destroy()
 
