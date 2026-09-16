@@ -316,4 +316,11 @@ meaningfully as a group.
 
 ## License
 
-This repository does not currently include a `LICENSE` file.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).
+
+You may use, modify and redistribute this software, including commercially,
+provided you keep the copyright notice and the license text with any copy or
+derivative work, state any significant changes you made, and do not use the
+author's name to endorse your derivative. The license also grants an explicit
+patent licence from the contributors.
