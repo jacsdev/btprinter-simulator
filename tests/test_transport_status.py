@@ -64,6 +64,11 @@ def test_stopped_transition_sets_connection_state():
     assert status.connection_state == "stopped"
 
 
+def test_data_flowing_transition_sets_connection_state():
+    status = _status(transport="serial").listening().data_flowing()
+    assert status.connection_state == "data_flowing"
+
+
 def test_add_bytes_accumulates_across_calls():
     status = _status().add_bytes(10).add_bytes(5)
     assert status.bytes_received == 15
@@ -203,6 +208,67 @@ def test_format_status_line_for_live_mode_is_unaffected_by_replay_path_default()
     status = _status().listening()
     line = format_status_line(status)
     assert "listening" in line.lower()
+
+
+# -- serial transport: honest connection status (no fake accept boundary) --
+#
+# A Windows incoming Bluetooth COM port has no accept/disconnect boundary
+# this transport can observe (see transport/serialport.py). These tests
+# pin down the invariant from the bug report: the displayed status text
+# must never claim to be "listening for a client" while bytes are
+# arriving, must never say "disconnected" (unobservable for this
+# transport), and must never contradict the byte/op counters shown
+# beside it.
+
+
+def test_serial_listening_label_does_not_claim_a_client_connection():
+    status = _status(transport="serial", endpoint="COM3").listening()
+    line = format_status_line(status)
+    assert "listening for a client" not in line.lower()
+    assert "client" not in line.lower()
+
+
+def test_serial_data_flowing_label_does_not_say_listening_for_a_client():
+    status = _status(transport="serial", endpoint="COM3").listening().data_flowing()
+    line = format_status_line(status)
+    assert "listening for a client" not in line.lower()
+    assert "receiving" in line.lower()
+
+
+def test_serial_status_and_counters_never_contradict_while_receiving():
+    status = (
+        _status(transport="serial", endpoint="COM3")
+        .listening()
+        .data_flowing()
+        .add_bytes(108)
+        .add_ops(12)
+    )
+    line = format_status_line(status)
+    assert "listening for a client" not in line.lower()
+    assert "108" in line
+    assert "12" in line
+
+
+def test_serial_status_returns_to_waiting_after_idle_without_claiming_disconnected():
+    status = (
+        _status(transport="serial", endpoint="COM3")
+        .listening()
+        .data_flowing()
+        .add_bytes(108)
+        .add_ops(12)
+        .listening()  # idle timeout: back to the waiting state
+    )
+    line = format_status_line(status)
+    assert "disconnected" not in line.lower()
+    assert "listening for a client" not in line.lower()
+    assert "108" in line
+    assert "12" in line
+
+
+def test_tcp_listening_label_is_unchanged_by_the_serial_specific_wording():
+    status = _status(transport="tcp", endpoint="port 9100").listening()
+    line = format_status_line(status)
+    assert "listening for a client" in line.lower()
 
 
 def test_format_empty_state_message_for_replay_mode_never_claims_listening():

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable, Optional
 
 from transport.port import OnDataCallback, Port
@@ -25,6 +26,7 @@ logger = logging.getLogger("btprinter.transport.serial")
 
 _READ_TIMEOUT = 0.5  # seconds; also doubles as the _running poll interval
 _RECV_CHUNK_SIZE = 4096
+_DEFAULT_IDLE_TIMEOUT = 3.0  # seconds of silence before returning to "listening"
 
 _SerialFactory = Callable[[], object]
 
@@ -41,30 +43,40 @@ class SerialPort(Port):
         self,
         com_port: str,
         baudrate: int = 9600,
+        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
         _serial_factory: Optional[_SerialFactory] = None,
     ) -> None:
         self._com_port = com_port
         self._baudrate = baudrate
+        self._idle_timeout = idle_timeout
         self._serial_factory = _serial_factory
         self._serial = None
         self._read_thread: Optional[threading.Thread] = None
         self._on_data: Optional[OnDataCallback] = None
         self._running = False
+        # Tracks the only thing this adapter can actually observe: whether
+        # bytes are currently flowing. See _read_loop()'s "listening" /
+        # "data_flowing" transitions below.
+        self._data_flowing = False
+        self._last_byte_time: Optional[float] = None
 
     def start(self, on_data: OnDataCallback) -> None:
         self._on_data = on_data
         factory = self._serial_factory or self._default_serial_factory()
         self._serial = factory()
         self._running = True
+        self._data_flowing = False
+        self._last_byte_time = None
         logger.info("Serial listener started on %s", self._com_port)
         # Unlike tcp/rfcomm, a Bluetooth "incoming" COM port has no
         # accept/read boundary this adapter can observe: by the time
         # start() can open it, Windows has already paired and connected
         # the peer, and pyserial exposes no API here to report the peer
-        # going away. So only "listening" (opened) and "stopped" (closed,
-        # in stop()) are ever emitted -- matching this adapter's behavior
-        # before this fix, which never had a "client connected"/"client
-        # disconnected" log message to begin with.
+        # going away. So this adapter never claims "connected"/
+        # "disconnected" -- it reports what it *can* observe instead:
+        # byte flow. "listening" here means "open, no bytes flowing right
+        # now"; _read_loop() moves to "data_flowing" once bytes arrive and
+        # back to "listening" after `idle_timeout` seconds of silence.
         self._emit_connection_event("listening")
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
@@ -91,11 +103,33 @@ class SerialPort(Port):
             except Exception:
                 logger.exception("serial read failed, stopping read loop")
                 break
+            now = time.monotonic()
             if not chunk:
                 # A read timeout with nothing available; loop again so we
                 # keep polling self._running without assuming any chunk
-                # boundary beyond whatever pyserial handed back.
+                # boundary beyond whatever pyserial handed back. If we were
+                # previously flowing and it has been quiet for
+                # idle_timeout seconds, report that honestly: back to
+                # "listening", never "disconnected" -- this adapter cannot
+                # tell a real disconnect from the peer simply going quiet.
+                if (
+                    self._data_flowing
+                    and self._last_byte_time is not None
+                    and (now - self._last_byte_time) >= self._idle_timeout
+                ):
+                    self._data_flowing = False
+                    logger.info(
+                        "no data for %.1fs on %s, returning to the waiting state",
+                        self._idle_timeout,
+                        self._com_port,
+                    )
+                    self._emit_connection_event("listening")
                 continue
+            if not self._data_flowing:
+                self._data_flowing = True
+                logger.info("data flowing on %s", self._com_port)
+                self._emit_connection_event("data_flowing")
+            self._last_byte_time = now
             if self._on_data is not None:
                 try:
                     self._on_data(chunk)

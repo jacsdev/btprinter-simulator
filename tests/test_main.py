@@ -333,6 +333,20 @@ def test_connection_event_handler_stopped_updates_status_store():
     assert viewer.statuses[-1].connection_state == "stopped"
 
 
+def test_connection_event_handler_data_flowing_updates_status_store():
+    # "data_flowing" is the serial transport's honest stand-in for
+    # "connected" -- see transport/serialport.py -- and must reach the
+    # status store exactly like every other connection event.
+    viewer = _FakeViewer()
+    status_store = main._StatusStore(_make_initial_status(), viewer)
+    on_event = main._make_connection_event_handler(status_store)
+
+    on_event("listening")
+    on_event("data_flowing")
+
+    assert viewer.statuses[-1].connection_state == "data_flowing"
+
+
 def test_no_reference_to_connection_event_bridge_remains():
     # The defect this change fixes: application state must never depend
     # on log message text. The bridge class must be gone entirely.

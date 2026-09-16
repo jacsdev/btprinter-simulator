@@ -343,6 +343,8 @@ def _make_connection_event_handler(status_store: "_StatusStore") -> ConnectionLi
             status_store.update(lambda status: status.client_connected(peer))
         elif event == "disconnected":
             status_store.update(lambda status: status.client_disconnected())
+        elif event == "data_flowing":
+            status_store.update(lambda status: status.data_flowing())
         elif event == "stopped":
             status_store.update(lambda status: status.stopped())
 

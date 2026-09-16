@@ -23,16 +23,25 @@ logger = logging.getLogger("btprinter.transport.port")
 
 OnDataCallback = Callable[[bytes], None]
 
-ConnectionEvent = Literal["listening", "connected", "disconnected", "stopped"]
+ConnectionEvent = Literal["listening", "connected", "disconnected", "stopped", "data_flowing"]
 """The connection lifecycle events an adapter reports through its
 connection listener (see `Port.set_connection_listener`):
 
 - "listening": the transport is bound/open and waiting for a client
-  (tcp/rfcomm), or the underlying channel has just been opened (serial).
+  (tcp/rfcomm) -- or, for serial, the COM port is open and no bytes are
+  currently flowing (this also fires again after a quiet period, see
+  "data_flowing" below).
 - "connected": a client connected. `peer` carries a peer address string
-  when the transport can supply one (tcp/rfcomm); `None` when it cannot
-  (serial has no accept boundary to observe -- see transport/serialport.py).
-- "disconnected": the previously connected client went away.
+  when the transport can supply one (tcp/rfcomm). Never emitted by
+  serial -- it has no accept boundary to observe (see
+  transport/serialport.py), so it never claims a connection it cannot
+  see.
+- "disconnected": the previously connected client went away. Never
+  emitted by serial for the same reason: it cannot distinguish "the peer
+  disconnected" from "the peer just went quiet".
+- "data_flowing": bytes started arriving after a quiet period. Emitted
+  only by serial, which cannot observe an accept boundary but can
+  observe byte flow -- this is its honest stand-in for "connected".
 - "stopped": the transport has been shut down and released its resources.
 """
 

@@ -53,7 +53,29 @@ _CONNECTION_STATE_LABELS = {
     "connected": "client connected",
     "disconnected": "client disconnected, waiting for a new client",
     "stopped": "stopped",
+    "data_flowing": "receiving data",
 }
+
+# The serial transport (transport/serialport.py) has no accept boundary it
+# can observe: by the time it opens the COM port, Windows has already
+# paired and connected the peer. Its "listening" state therefore means
+# something different from tcp/rfcomm's -- "open, no bytes flowing right
+# now" rather than "waiting for a client to connect" -- and must be worded
+# accordingly instead of falsely claiming to watch for a connection
+# handshake it cannot see.
+_SERIAL_CONNECTION_STATE_LABELS = {
+    "listening": "open, waiting for data",
+}
+
+
+def _connection_state_label(status: "TransportStatus") -> str:
+    """Resolve the display label for `status.connection_state`, honoring
+    the serial-specific override above where it applies."""
+    if status.transport == "serial":
+        serial_label = _SERIAL_CONNECTION_STATE_LABELS.get(status.connection_state)
+        if serial_label is not None:
+            return serial_label
+    return _CONNECTION_STATE_LABELS.get(status.connection_state, status.connection_state)
 
 
 @dataclass(frozen=True)
@@ -93,6 +115,12 @@ class TransportStatus:
 
     def stopped(self) -> "TransportStatus":
         return replace(self, connection_state="stopped")
+
+    def data_flowing(self) -> "TransportStatus":
+        """The serial transport's honest stand-in for `client_connected()`:
+        it cannot observe an accept handshake, only that bytes started
+        arriving after a quiet period (see transport/serialport.py)."""
+        return replace(self, connection_state="data_flowing")
 
     def with_endpoint(self, endpoint: str, sdp_uuid: Optional[str] = None) -> "TransportStatus":
         """Update the endpoint (and optionally the SDP UUID) once the
@@ -140,7 +168,7 @@ def format_status_line(status: TransportStatus) -> str:
     parts.append(f"Paper: {status.width_mm}mm")
     parts.append(f"Code pages: {status.codepages_label}")
 
-    state_label = _CONNECTION_STATE_LABELS.get(status.connection_state, status.connection_state)
+    state_label = _connection_state_label(status)
     if status.connection_state == "connected" and status.peer:
         state_label = f"{state_label} ({status.peer})"
     parts.append(f"Status: {state_label}")
@@ -171,6 +199,21 @@ def format_empty_state_message(status: Optional[TransportStatus]) -> str:
         return (
             f"Client connected via {status.transport.upper()}{peer_note}.\n"
             "Waiting for the first ESC/POS bytes..."
+        )
+    if status.connection_state == "data_flowing":
+        # The serial transport's honest stand-in for "connected" -- it has
+        # no accept boundary to report a peer address for.
+        return (
+            f"Receiving data via {status.transport.upper()}.\n"
+            "No receipt rendered yet from the bytes received so far."
+        )
+    if status.transport == "serial":
+        # Serial has no accept boundary to observe -- never claim to be
+        # waiting for a "client to connect" the way tcp/rfcomm can.
+        return (
+            "Simulator is running and idle.\n"
+            f"Waiting for data on {status.endpoint}.\n"
+            "No receipt data received yet."
         )
     return (
         "Simulator is running and idle.\n"

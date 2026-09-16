@@ -157,10 +157,15 @@ def test_write_swallows_errors_from_the_serial_port():
 # Unlike tcp/rfcomm, a Bluetooth "incoming" COM port has no accept/read
 # boundary this adapter can observe -- by the time `start()` can open it,
 # Windows has already paired and connected the peer, and pyserial has no
-# API here to report the peer going away. So this adapter only ever
-# reports "listening" (COM port opened) and "stopped" (COM port closed),
-# matching its behavior before this fix (it never had a "client
-# connected"/"client disconnected" log message to begin with).
+# API here to report the peer going away. So this adapter never emits
+# "connected"/"disconnected": those would claim an accept/peer-loss
+# observation this transport cannot make. What it *can* observe is byte
+# flow, so it reports that instead:
+#
+# - "listening": the COM port is open and no bytes are currently flowing
+#   (on start(), and again after `idle_timeout` seconds of silence).
+# - "data_flowing": at least one byte arrived after a quiet period.
+# - "stopped": the COM port has been closed.
 # ---------------------------------------------------------------------------
 
 
@@ -176,6 +181,65 @@ def test_serial_port_emits_listening_on_start_and_stopped_on_stop():
     port.stop()
 
     assert events == [("listening", None), ("stopped", None)]
+
+
+def test_serial_port_emits_data_flowing_when_bytes_arrive_after_listening():
+    from transport.serialport import SerialPort
+
+    events: list[tuple[str, object]] = []
+    got_data_flowing = threading.Event()
+
+    def listener(event, peer=None):
+        events.append((event, peer))
+        if event == "data_flowing":
+            got_data_flowing.set()
+
+    # idle_timeout is large so the idle-return transition never fires
+    # during this test -- only the listening -> data_flowing move matters.
+    fake_serial = _FakeSerial([b"\x1b\x40HELLO\x0a"])
+    port = SerialPort(com_port="COM5", idle_timeout=5.0, _serial_factory=lambda: fake_serial)
+    port.set_connection_listener(listener)
+
+    try:
+        port.start(lambda chunk: None)
+        assert got_data_flowing.wait(timeout=2.0)
+    finally:
+        port.stop()
+
+    assert events[0] == ("listening", None)
+    assert events[1] == ("data_flowing", None)
+    assert all(event not in ("connected", "disconnected") for event, _ in events)
+
+
+def test_serial_port_returns_to_listening_after_idle_timeout_without_disconnecting():
+    from transport.serialport import SerialPort
+
+    events: list[tuple[str, object]] = []
+    returned_to_listening = threading.Event()
+
+    def listener(event, peer=None):
+        events.append((event, peer))
+        if event == "listening" and len(events) > 1:
+            returned_to_listening.set()
+
+    # A single chunk, then silence -- the fake keeps returning b"" (a read
+    # timeout with nothing available), exactly like a real quiet COM port.
+    fake_serial = _FakeSerial([b"\x01"])
+    port = SerialPort(com_port="COM5", idle_timeout=0.05, _serial_factory=lambda: fake_serial)
+    port.set_connection_listener(listener)
+
+    try:
+        port.start(lambda chunk: None)
+        assert returned_to_listening.wait(timeout=2.0)
+    finally:
+        port.stop()
+
+    assert events[0] == ("listening", None)
+    assert events[1] == ("data_flowing", None)
+    assert events[2] == ("listening", None)
+    # The adapter genuinely cannot know whether the peer disconnected or
+    # simply went quiet -- it must never claim "disconnected".
+    assert all(event != "disconnected" for event, _ in events)
 
 
 def test_serial_port_listener_exception_does_not_kill_the_read_loop():
