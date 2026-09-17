@@ -23,6 +23,13 @@ class TextOp:
 
     text: str
     style: PrinterState
+    # The exact source bytes `text` was decoded from (before ESC t code
+    # page decoding and the ESC R international-charset substitution
+    # were applied -- see `core.parser.Parser._parse_text`). Additive
+    # field, defaulted for backward compatibility: the render pipeline
+    # never reads it, it exists purely so `core.comparative_decode` can
+    # offer an inspection-only side view without a second parsing pass.
+    raw: bytes = b""
 
 
 @dataclass

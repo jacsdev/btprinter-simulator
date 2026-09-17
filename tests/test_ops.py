@@ -16,6 +16,14 @@ def test_text_op_carries_text_and_style_snapshot():
     assert op.style is style
 
 
+def test_text_op_raw_defaults_to_empty_bytes():
+    # Additive field (see core.parser._parse_text): existing callers that
+    # only ever cared about the decoded text must keep working unchanged.
+    op = TextOp(text="hello", style=PrinterState())
+
+    assert op.raw == b""
+
+
 def test_feed_op_equality_by_value():
     assert FeedOp(lines=3) == FeedOp(lines=3)
     assert FeedOp(lines=3) != FeedOp(lines=4)

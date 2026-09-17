@@ -509,6 +509,59 @@ def test_viewer_diagnostics_window_omits_source_when_not_attributed(tk_root):
         viewer.destroy()
 
 
+# -- comparative code page decoder (inspection-only side view) -----------
+
+
+def test_viewer_codepage_comparison_window_shows_each_text_run_under_every_candidate(tk_root):
+    viewer = _make_viewer(tk_root)
+    try:
+        parser = Parser()
+        parser.feed(bytes([0x1B, 0x74, 2]))  # ESC t 2 -> CP850
+        ops = parser.feed(bytes([0xE9]))  # decodes differently per candidate
+        viewer.update_ops(ops)
+
+        listbox = viewer._show_codepage_comparison_window()
+
+        # One entry per candidate code page for the single text run fed
+        # above; each entry must show that candidate's own decoding.
+        contents = "\n".join(listbox.get(0, tk.END))
+        assert bytes([0xE9]).decode("cp437") in contents
+        assert bytes([0xE9]).decode("cp850") in contents
+        assert bytes([0xE9]).decode("cp1252") in contents
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_codepage_comparison_window_with_no_text_runs_does_not_crash(tk_root):
+    viewer = _make_viewer(tk_root)
+    try:
+        listbox = viewer._show_codepage_comparison_window()
+
+        assert listbox.size() >= 1  # some "nothing to compare yet" message
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_opening_codepage_comparison_does_not_change_the_rendered_receipt(tk_root):
+    # Pure inspection: this side view must never be able to alter what
+    # the receipt itself looks like, no matter how many times it's opened.
+    viewer = _make_viewer(tk_root)
+    try:
+        parser = Parser()
+        parser.feed(bytes([0x1B, 0x74, 2]))
+        ops = parser.feed(b"cafe\x1b\x74\x10 mais texto")
+        viewer.update_ops(ops)
+
+        before = viewer.get_current_image().tobytes()
+        viewer._show_codepage_comparison_window()
+        viewer._show_codepage_comparison_window()
+        after = viewer.get_current_image().tobytes()
+
+        assert before == after
+    finally:
+        viewer.destroy()
+
+
 # -- 32-column ruler ------------------------------------------------------
 
 

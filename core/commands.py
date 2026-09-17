@@ -34,14 +34,63 @@ SYN = 0x16  # synchronous idle: no standalone meaning in this profile
 # (this table) are independent, and when they disagree the printer
 # produces mojibake on paper -- which this simulator must reproduce
 # faithfully rather than silently correct.
+#
+# The id numbering follows Epson's TM-series ESC/POS numbering, sourced
+# from the `receipt-print-hq/escpos-printer-db` project's compiled
+# `dist/capabilities.json` (the "TM-T88V" and merged "default" printer
+# profiles' `codePages` tables -- both agree on every id below). Each
+# entry is included only if Python's stdlib `codecs` module actually
+# ships a matching codec (verified with `codecs.lookup`); this is a
+# decoding capability table for *this simulator*, independent of
+# `implemented_codepages` (see `Parser.__init__`), which instead models
+# a specific printer's hardware limitations.
+#
+# Deliberately NOT mapped, with the reason for each:
+#   - 6, 7, 8, 20, 22-26, 66-75, 82, 254, 255: listed as "Unknown" in
+#     escpos-printer-db itself -- no printer in that database assigns a
+#     real code page to these ids, so there is nothing to decode them
+#     as. 255 is explicitly a "no code page selected" sentinel.
+#   - 11 (CP851), 12 (CP853), 41 (CP1098), 42 (CP774), 43 (CP772): real,
+#     named code pages in escpos-printer-db, but Python's stdlib has no
+#     matching codec for any of them.
+#   - 30 (TCVN-3-1), 31 (TCVN-3-2): Vietnamese code pages with no
+#     Python stdlib codec either.
 CODEPAGE_MAP = {
     0: "cp437",
+    1: "cp932",
     2: "cp850",
     3: "cp860",
     4: "cp863",
     5: "cp865",
+    13: "cp857",
+    14: "cp737",
+    15: "iso8859_7",
     16: "cp1252",
     17: "cp866",
     18: "cp852",
     19: "cp858",
+    21: "cp874",
+    32: "cp720",
+    33: "cp775",
+    34: "cp855",
+    35: "cp861",
+    36: "cp862",
+    37: "cp864",
+    38: "cp869",
+    39: "iso8859_2",
+    40: "iso8859_15",
+    44: "cp1125",
+    45: "cp1250",
+    46: "cp1251",
+    47: "cp1253",
+    48: "cp1254",
+    49: "cp1255",
+    50: "cp1256",
+    51: "cp1257",
+    52: "cp1258",
+    # 53 (RK1048/Kazakh): escpos-printer-db gives no `python_encode`
+    # hint for this one, but Python's stdlib does ship a matching
+    # codec under a different name ("kz1048") -- verified directly via
+    # `codecs.lookup("kz1048")` rather than via that project's data.
+    53: "kz1048",
 }

@@ -40,8 +40,9 @@ from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageTk
 
+from core.comparative_decode import decode_under_candidates
 from core.diagnostics import Diagnostic
-from core.ops import CutOp
+from core.ops import CutOp, TextOp
 from render.raster import ReceiptRenderer, ruler_x_position
 from render.receipts import Receipt, split_into_receipts
 from render.scroll_policy import is_scrolled_to_bottom, should_autoscroll_on_new_content
@@ -362,6 +363,11 @@ class Viewer:
 
         self._diagnostics_button = tk.Button(toolbar, text="Details", command=self._show_diagnostics_window)
         self._diagnostics_button.pack(side=tk.LEFT, padx=2)
+
+        self._codepage_compare_button = tk.Button(
+            toolbar, text="Compare code pages...", command=self._show_codepage_comparison_window
+        )
+        self._codepage_compare_button.pack(side=tk.LEFT, padx=6)
 
     def _build_status_bar(self) -> None:
         self._status_var = tk.StringVar(master=self._root)
@@ -826,4 +832,32 @@ class Viewer:
                 # (see core.diagnostics.Diagnostic.source).
                 line += f"  source={diag.source}"
             listbox.insert(tk.END, line)
+        return listbox
+
+    def _show_codepage_comparison_window(self) -> tk.Listbox:
+        """Open the comparative code page decoder (see
+        `core.comparative_decode`): every text run accumulated so far,
+        decoded under every candidate code page side by side.
+
+        Pure inspection -- reads `self._ops` and `core.comparative_decode`
+        only, never writes to `self._ops`, `self._current_image`, or any
+        parser/render state, so opening this window can never change
+        what the receipt itself renders as (see
+        tests/test_viewer.py::test_viewer_opening_codepage_comparison_does_not_change_the_rendered_receipt).
+        """
+        window = tk.Toplevel(self._root)
+        window.title("Compare code pages")
+        listbox = tk.Listbox(window, width=100)
+        listbox.pack(fill=tk.BOTH, expand=True)
+
+        text_runs = [op for op in self._ops if isinstance(op, TextOp) and op.raw]
+        if not text_runs:
+            listbox.insert(tk.END, "No text runs to compare yet.")
+            return listbox
+
+        for index, op in enumerate(text_runs):
+            listbox.insert(tk.END, f"-- run {index}: raw bytes {op.raw.hex(' ')} " f"(rendered as: {op.text!r}) --")
+            candidates = decode_under_candidates(op.raw)
+            for cid in sorted(candidates):
+                listbox.insert(tk.END, f"    id={cid}: {candidates[cid]!r}")
         return listbox

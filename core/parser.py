@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, List, Optional, Set, Tuple
 
-from core import commands
+from core import charsets, commands
 from core.diagnostics import Diagnostic
 from core.ops import (
     BarcodeOp,
@@ -249,8 +249,41 @@ class Parser:
         while end < len(buf) and buf[end] >= 0x20:
             end += 1
         codec = commands.CODEPAGE_MAP.get(self.state.code_table, "cp437")
-        text = buf[:end].decode(codec, errors="replace")
-        return end, [TextOp(text=text, style=self.state.snapshot())]
+        raw = buf[:end]
+        text = raw.decode(codec, errors="replace")
+        text = self._apply_international_charset(raw, text)
+        return end, [TextOp(text=text, style=self.state.snapshot(), raw=raw)]
+
+    def _apply_international_charset(self, raw: bytes, text: str) -> str:
+        """Re-map the 12 ESC R "international" positions in `text`
+        according to `self.state.charset` (see `core.charsets`).
+
+        This runs right after code page decoding, on the same text run,
+        because both are just different views of "how do we turn bytes
+        the sender already sent into the glyph a real print head would
+        strike" -- `ESC t` picks the table, `ESC R` patches 12 positions
+        of it. Keeping both here means `render/` never has to know this
+        feature exists; it only ever sees the final decoded string.
+
+        `raw` and `text` are assumed index-aligned: true for every codec
+        in `commands.CODEPAGE_MAP` today, since none of them decode a
+        byte below 0x80 (the only bytes ESC R ever substitutes) into
+        anything but a single character at the same position.
+        """
+        if self.state.charset == 0:
+            return text  # USA: charsets.INTERNATIONAL_CHARSETS[0] is a
+            # no-op table anyway, but skip the loop for the common case.
+        chars: Optional[List[str]] = None
+        for i, byte in enumerate(raw):
+            if i >= len(text) or byte not in charsets.SUBSTITUTION_POSITIONS:
+                continue
+            replacement = charsets.resolve_substitution(self.state.charset, byte)
+            if replacement is None:
+                continue
+            if chars is None:
+                chars = list(text)
+            chars[i] = replacement
+        return text if chars is None else "".join(chars)
 
     # -- DLE (real-time status queries) --------------------------------
 
@@ -331,7 +364,7 @@ class Parser:
             return self._need(buf, 3, lambda n: self._set_code_table(n))
 
         if cmd == 0x52:  # ESC R n - international charset
-            return self._need(buf, 3, lambda n: setattr(self.state, "charset", n))
+            return self._need(buf, 3, lambda n: self._set_charset(n))
 
         if cmd == 0x64:  # ESC d n - feed n lines
             if len(buf) < 3:
@@ -424,6 +457,33 @@ class Parser:
         self.state.font = "B" if n & 0x01 else "A"
 
     def _set_code_table(self, n: int) -> None:
+        # Two independent things can make `n` unusable, and they must not
+        # be conflated into one diagnostic:
+        #  - `n` is not in CODEPAGE_MAP at all: this simulator has no
+        #    codec for it, period. That is *our* limitation, so it is
+        #    reported here, unconditionally, regardless of
+        #    `_implemented_codepages` -- a caller could even have
+        #    explicitly claimed to "implement" an id we still can't
+        #    decode.
+        #  - `n` is in CODEPAGE_MAP but outside `_implemented_codepages`:
+        #    handled below, unchanged from before -- this models the
+        #    modeled printer's own hardware limitation, already
+        #    diagnosed via logger.warning.
+        if n not in commands.CODEPAGE_MAP:
+            diagnostic = Diagnostic(
+                offset=self._stream_offset,
+                raw_bytes=bytes([commands.ESC, 0x74, n]),
+                reason=(
+                    f"ESC t: code page {n} is not a table this simulator "
+                    "knows how to decode; rendered text uses a guessed "
+                    "fallback codec and should not be trusted"
+                ),
+                severity="warning",
+            )
+            self._diagnostics.append(diagnostic)
+            if self._diagnostics_sink is not None:
+                self._diagnostics_sink(diagnostic)
+
         # Real firmware silently ignores a request for a table it does not
         # physically carry and stays on whatever table was already active
         # (factory default CP437 after a reset). This does not "fix"
@@ -437,6 +497,33 @@ class Parser:
             )
             n = 0
         self.state.code_table = n
+
+    def _set_charset(self, n: int) -> None:
+        # `state.charset` always records exactly what the sender asked
+        # for -- unlike `_set_code_table`, this never rewrites `n` to a
+        # fallback value, because the fallback here is purely a
+        # rendering decision (see `_apply_international_charset`), not
+        # a hardware limitation being modeled. When `n` has no sourced
+        # substitution table (see `core.charsets`), that rendering
+        # fallback is silent by design (never invents glyphs), so a
+        # diagnostic is raised here instead, once per selection, to
+        # make sure it is not silently trusted.
+        self.state.charset = n
+        if not charsets.is_verified(n):
+            diagnostic = Diagnostic(
+                offset=self._stream_offset,
+                raw_bytes=bytes([commands.ESC, 0x52, n]),
+                reason=(
+                    f"ESC R: international charset {n} has no sourced "
+                    "substitution table in this simulator; rendering "
+                    "falls back to unmodified US/ASCII glyphs at the 12 "
+                    "positions it would otherwise change"
+                ),
+                severity="warning",
+            )
+            self._diagnostics.append(diagnostic)
+            if self._diagnostics_sink is not None:
+                self._diagnostics_sink(diagnostic)
 
     def _set_print_mode(self, n: int) -> None:
         # ESC ! bitmask (Epson-compatible): bit0=font B, bit3=emphasized,

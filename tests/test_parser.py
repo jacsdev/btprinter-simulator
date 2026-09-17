@@ -187,6 +187,86 @@ def test_esc_r_sets_charset():
 
 
 # ---------------------------------------------------------------------------
+# ESC R - international character set substitution (P0)
+#
+# ESC R n does not just record `n`; it changes what 12 specific ASCII
+# byte values actually render as. These tests assert on the decoded
+# TextOp.text (the same thing that gets drawn), not on parser.state,
+# so a regression that stores the charset but forgets to apply it would
+# fail here.
+# ---------------------------------------------------------------------------
+
+
+def test_esc_r_france_substitutes_hash_with_pound_sign():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x52, 1]))  # ESC R 1 -> France
+    ops = parser.feed(b"#1")
+
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.text == "£1"
+    assert text_op.text != "#1"
+
+
+def test_esc_r_germany_substitutes_at_with_section_sign():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x52, 2]))  # ESC R 2 -> Germany
+    ops = parser.feed(b"user@host")
+
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.text == "user§host"
+
+
+def test_esc_r_charset_differs_from_usa_rendering_for_the_same_bytes():
+    raw = b"#$@[\\]^`{|}~"
+
+    usa_parser = make_parser()
+    usa_ops = usa_parser.feed(raw)
+    usa_text = next(op for op in usa_ops if isinstance(op, TextOp)).text
+
+    italy_parser = make_parser()
+    italy_parser.feed(bytes([0x1B, 0x52, 6]))  # ESC R 6 -> Italy
+    italy_ops = italy_parser.feed(raw)
+    italy_text = next(op for op in italy_ops if isinstance(op, TextOp)).text
+
+    assert usa_text == "#$@[\\]^`{|}~"
+    assert italy_text != usa_text
+    assert italy_text == "£$§°çé^ùàòèì"
+
+
+def test_esc_r_reset_by_esc_at_restores_usa_rendering():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x52, 1]))  # France
+    parser.feed(bytes([0x1B, 0x40]))  # ESC @ reset
+    ops = parser.feed(b"#")
+
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.text == "#"
+
+
+def test_esc_r_unverified_charset_falls_back_to_usa_glyphs_and_emits_diagnostic():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x52, 12]))  # ESC R 12 -> "Latin America", unverified
+    ops = parser.feed(b"#$@")
+
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    # Honest degradation: unverified charset renders as plain ASCII, not a
+    # guessed substitution -- never silently "fixed".
+    assert text_op.text == "#$@"
+
+    diagnostics = parser.take_diagnostics()
+    assert len(diagnostics) == 1
+    assert "12" in diagnostics[0].reason
+    assert diagnostics[0].severity == "warning"
+
+
+def test_esc_r_verified_charset_selection_emits_no_diagnostic():
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x52, 1]))  # France, verified
+
+    assert parser.take_diagnostics() == []
+
+
+# ---------------------------------------------------------------------------
 # ESC t - code page selection and mojibake fidelity
 #
 # `ESC t n` never changes how the sender encoded its bytes; it only tells
@@ -236,6 +316,68 @@ def test_esc_t_unimplemented_codepage_falls_back_to_cp437(caplog):
 
     assert parser.state.code_table == 0
     assert any("16" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# ESC t - unknown-to-us code page ids (P1)
+#
+# `CODEPAGE_MAP` is this simulator's own decoding knowledge, independent
+# of `implemented_codepages` (which models a specific printer profile's
+# hardware limitation and is already diagnosed via logger.warning, see
+# above). Selecting an id absent from `CODEPAGE_MAP` is *our* limitation,
+# not the modeled printer's, and must say so through the structured
+# diagnostics channel -- silently decoding as CP437 with zero diagnostic
+# is the exact regression this covers.
+# ---------------------------------------------------------------------------
+
+
+def test_esc_t_id_absent_from_codepage_map_emits_a_diagnostic_naming_it():
+    parser = Parser()  # id 11 (CP851) has no Python stdlib codec -- absent
+    # from CODEPAGE_MAP by design (see core/commands.py).
+
+    parser.feed(bytes([0x1B, 0x74, 11]))
+
+    diagnostics = parser.take_diagnostics()
+    assert len(diagnostics) == 1
+    assert "11" in diagnostics[0].reason
+    assert diagnostics[0].severity == "warning"
+
+
+def test_esc_t_id_absent_from_codepage_map_still_renders_something_not_crash():
+    parser = Parser()
+    parser.feed(bytes([0x1B, 0x74, 11]))
+
+    ops = parser.feed(b"hello")
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.text == "hello"  # ASCII range is unaffected either way
+
+
+def test_text_op_raw_carries_the_exact_source_bytes_independent_of_decoding():
+    # core.comparative_decode re-decodes this under other candidate code
+    # pages, so it needs the original bytes, not just the (already
+    # code-page-decoded, ESC-R-substituted) `text` field.
+    parser = make_parser()
+    parser.feed(bytes([0x1B, 0x74, 2]))  # ESC t 2 -> CP850
+    raw_bytes = bytes([0xE9, 0x41])  # 'é' under cp850, decodes differently elsewhere
+
+    ops = parser.feed(raw_bytes)
+
+    text_op = next(op for op in ops if isinstance(op, TextOp))
+    assert text_op.raw == raw_bytes
+    assert text_op.text == raw_bytes.decode("cp850")
+
+
+def test_esc_t_mapped_but_printer_excluded_codepage_emits_no_unknown_id_diagnostic():
+    # Distinct from the case above: 16 (CP1252) IS something this
+    # simulator knows how to decode -- it is only unavailable on this
+    # particular (restricted) printer profile. That must stay on the
+    # existing logger.warning-only path, never conflated with the new
+    # structured "we can't decode this at all" diagnostic.
+    parser = Parser(implemented_codepages={0, 2})  # 16 not implemented here
+
+    parser.feed(bytes([0x1B, 0x74, 16]))
+
+    assert parser.take_diagnostics() == []
 
     # Subsequent text still decodes with the fallback table (CP437), not
     # the unimplemented one that was requested.
