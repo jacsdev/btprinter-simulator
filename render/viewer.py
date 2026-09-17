@@ -27,6 +27,15 @@ a replayed file through a fresh `Parser`) without `render/` importing
 
 Keybinding: press "s" while the window has focus to save the current
 receipt to a PNG file (prompted via a simple save dialog).
+
+"Save capture..." (toolbar button) exports the *raw* ESC/POS byte
+stream instead of a rendered image -- see `append_raw_bytes()` and
+`get_capture_target()` below. The need for a raw capture is almost
+always discovered only after something already looks wrong on screen,
+by which point a capture that only started recording from a button
+press would have missed everything; the viewer therefore always
+buffers received bytes (bounded, see `_RAW_CAPTURE_MAX_BYTES`) so the
+export is retroactive.
 """
 
 from __future__ import annotations
@@ -35,7 +44,7 @@ import logging
 import tkinter as tk
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageTk
@@ -65,6 +74,23 @@ _RULER_FONT = "A"  # the ruler always marks the Font A column budget for the act
 # simply re-rendered on demand if they are needed again (a cache miss,
 # never a correctness issue -- see _get_cached_receipt_image()).
 _RECEIPT_CACHE_MAX_ENTRIES = 64
+
+# Cap on the in-memory raw byte buffer backing "Save capture..." (see
+# append_raw_bytes()). A heavy real-world print is around 30 KB, so 8 MiB
+# holds roughly 250 heavy prints' worth of raw bytes -- generous for
+# anything a person would do in one sitting -- while still bounding
+# memory for a simulator left running unattended for a long time
+# (--dump-bytes remains the right tool for that case; it writes straight
+# to disk instead of holding everything in RAM). Once the cap is
+# exceeded, the OLDEST bytes are discarded -- the most recent activity
+# is what a person actually wants to inspect after noticing something
+# wrong -- and `_raw_capture_truncated` is recorded so the capture UI
+# can say the result is partial instead of silently handing back a
+# short file with no explanation. Trade-off: a session that runs long
+# enough to exceed this cap can no longer export its earliest bytes
+# from memory; --dump-bytes is unaffected and keeps the full history on
+# disk regardless of this cap.
+_RAW_CAPTURE_MAX_BYTES = 8 * 1024 * 1024
 
 _CONNECTION_STATE_LABELS = {
     "starting": "starting...",
@@ -249,6 +275,24 @@ def _format_diagnostics_label(count: int) -> str:
     return f"{count} unknown command{'s' if count != 1 else ''}"
 
 
+@dataclass(frozen=True)
+class CaptureTarget:
+    """What "Save capture..." is about to write.
+
+    Built by `Viewer.get_capture_target()` from whatever is currently
+    selected in the session history panel -- a single receipt's bytes
+    if one is selected, the whole session's buffered bytes otherwise.
+    Deliberately Tk-free (it only reads the listbox's own current
+    selection, never opens a dialog) so the selection logic is directly
+    testable without mocking anything beyond the save dialog itself.
+    """
+
+    label: str  # human-readable description shown in the save dialog title
+    data: bytes  # the raw bytes that would be written
+    is_partial: bool  # True if the capture buffer's cap already dropped some of this range
+    default_filename: str
+
+
 class Viewer:
     """Live receipt window plus a headless-testable rendering pipeline.
 
@@ -300,6 +344,20 @@ class Viewer:
         # gives cheap LRU eviction via move_to_end()/popitem(last=False).
         self._receipt_image_cache: "OrderedDict[Tuple[int, int], Image.Image]" = OrderedDict()
         self._current_image: Image.Image = self._renderer.render([])
+        # Raw byte capture buffer backing "Save capture..." -- see
+        # append_raw_bytes()/_RAW_CAPTURE_MAX_BYTES. Independent of
+        # self._ops/self._receipts: it holds the bytes themselves, not
+        # what the parser made of them, so a capture can be exported
+        # byte-for-byte regardless of how it renders.
+        self._raw_capture: bytearray = bytearray()
+        # Global offset of self._raw_capture[0] -- i.e. how many bytes
+        # have been evicted from the front of the buffer so far. 0 until
+        # the cap is first exceeded.
+        self._raw_capture_start_offset: int = 0
+        # Total bytes ever handed to append_raw_bytes(), independent of
+        # how many are still actually held (some may have been evicted).
+        self._raw_capture_total_seen: int = 0
+        self._raw_capture_truncated: bool = False
         self._status: Optional[TransportStatus] = status
         self._on_clear = on_clear
         self._on_open = on_open
@@ -341,6 +399,11 @@ class Viewer:
 
         self._open_button = tk.Button(toolbar, text="Open...", command=self._on_open_click)
         self._open_button.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self._save_capture_button = tk.Button(
+            toolbar, text="Save capture...", command=self._on_save_capture_click
+        )
+        self._save_capture_button.pack(side=tk.LEFT, padx=2, pady=2)
 
         self._ruler_var = tk.BooleanVar(master=self._root, value=False)
         self._ruler_check = tk.Checkbutton(
@@ -525,6 +588,14 @@ class Viewer:
         # rather than let a stale one survive under a reused index.
         self._receipt_image_cache.clear()
         self._current_image = self._renderer.render([])
+        # Same wholesale-replacement reasoning as the receipt cache above:
+        # bytes captured before a Clear ("new paper") or an Open/--replay
+        # reload belong to a session that no longer exists on screen, so
+        # "Save capture..." must never mix them into what comes next.
+        self._raw_capture = bytearray()
+        self._raw_capture_start_offset = 0
+        self._raw_capture_total_seen = 0
+        self._raw_capture_truncated = False
 
         self._refresh_diagnostics_label()
         self._refresh_history_panel()
@@ -620,6 +691,114 @@ class Viewer:
     def save_png(self, path: str) -> None:
         self._current_image.convert("RGB").save(path, format="PNG")
         logger.info("saved receipt to %s", path)
+
+    def append_raw_bytes(self, data: bytes) -> None:
+        """Append newly received/loaded raw bytes to the in-memory
+        capture buffer backing "Save capture..." (see
+        `get_capture_target()`).
+
+        Called once per chunk, in lockstep with `update_ops()` (same
+        chunk, same call site -- see `main.py`'s `on_data()`,
+        `_make_open_handler()` and `run_replay()`), so the buffer's own
+        running total (`_raw_capture_total_seen`) always matches the
+        byte-offset coordinate space `update_ops()` derives receipts'
+        `byte_count` in. That is what lets `get_capture_target()` slice
+        the buffer by receipt without needing render.receipts to know
+        anything about raw bytes at all.
+
+        Bounded by `_RAW_CAPTURE_MAX_BYTES`: once exceeded, the oldest
+        bytes are dropped and `_raw_capture_truncated` is set so the
+        capture UI can say the result is partial (see that constant's
+        docstring for the trade-off). Independent of `--dump-bytes`,
+        which writes straight to disk and is not subject to this cap.
+        """
+        if not data:
+            return
+        self._raw_capture.extend(data)
+        self._raw_capture_total_seen += len(data)
+        overflow = len(self._raw_capture) - _RAW_CAPTURE_MAX_BYTES
+        if overflow > 0:
+            del self._raw_capture[:overflow]
+            self._raw_capture_start_offset += overflow
+            self._raw_capture_truncated = True
+
+    def _receipt_byte_range(self, index: int) -> Tuple[int, int]:
+        """Global `[start, end)` byte offset -- in the same coordinate
+        space as `append_raw_bytes()`'s running total -- spanned by the
+        receipt at this position in `self._receipts`.
+
+        Receipts partition `self._ops` (and therefore the byte stream)
+        contiguously and in arrival order (see
+        `render.receipts.split_into_receipts()`), so a receipt's start
+        offset is just the sum of every earlier receipt's `byte_count`;
+        no separate bookkeeping is needed.
+        """
+        start = sum(r.byte_count or 0 for r in self._receipts[:index])
+        end = start + (self._receipts[index].byte_count or 0)
+        return start, end
+
+    def _sliced_capture(self, start: int, end: int) -> Tuple[bytes, bool]:
+        """Return the raw bytes in `[start, end)` still held in the
+        capture buffer, plus whether any bytes in that range have
+        already been evicted by the buffer's cap (a partial capture).
+
+        The buffer only ever evicts from the front, so a requested range
+        can only be partial at its start, never in the middle or at the
+        end.
+        """
+        buffer_start = self._raw_capture_start_offset
+        buffer_end = buffer_start + len(self._raw_capture)
+        clipped_start = max(start, buffer_start)
+        clipped_end = min(end, buffer_end)
+        is_partial = clipped_start > start
+        if clipped_end <= clipped_start:
+            return b"", is_partial
+        rel_start = clipped_start - buffer_start
+        rel_end = clipped_end - buffer_start
+        return bytes(self._raw_capture[rel_start:rel_end]), is_partial
+
+    def get_capture_target(self) -> CaptureTarget:
+        """Determine what "Save capture..." is about to write.
+
+        If a receipt is currently selected in the session history
+        panel, only that receipt's raw bytes are targeted -- a single
+        receipt is normally the fixture a person actually wants,
+        whereas a whole session mixing several prints together is not.
+        With no selection, the whole session's buffered bytes are
+        targeted instead.
+
+        Deliberately free of any dialog: this only reads the history
+        listbox's own current selection, so it is directly testable
+        (see tests/test_save_capture.py) without mocking `filedialog`.
+        """
+        selection = self._history_listbox.curselection()
+        if selection and selection[0] < len(self._receipts):
+            index = selection[0]
+            receipt = self._receipts[index]
+            start, end = self._receipt_byte_range(index)
+            data, is_partial = self._sliced_capture(start, end)
+            return CaptureTarget(
+                label=f"receipt #{receipt.sequence} ({len(data)} bytes)",
+                data=data,
+                is_partial=is_partial,
+                default_filename=f"receipt-{receipt.sequence}.bin",
+            )
+
+        data, is_partial = self._sliced_capture(0, self._raw_capture_total_seen)
+        return CaptureTarget(
+            label=f"whole session ({len(data)} bytes)",
+            data=data,
+            is_partial=is_partial,
+            default_filename="session-capture.bin",
+        )
+
+    def save_capture(self, path: str, data: bytes) -> None:
+        """Write raw captured bytes to `path`, byte-for-byte -- binary
+        mode, no newline translation -- so the result is directly usable
+        with `--replay`."""
+        with open(path, "wb") as f:
+            f.write(data)
+        logger.info("saved capture to %s (%d bytes)", path, len(data))
 
     def destroy(self) -> None:
         try:
@@ -780,6 +959,41 @@ class Viewer:
         )
         if path:
             self.save_png(path)
+
+    def _on_save_capture_click(self) -> None:
+        """"Save capture...": export the raw byte capture buffer.
+
+        Which slice is offered (selected receipt vs. whole session) is
+        entirely decided by `get_capture_target()`; this method only
+        adds the two genuinely Tk-dependent steps around it -- warning
+        honestly when the buffer's cap already dropped part of what was
+        requested, and the save dialog itself -- so those are the only
+        parts a test would need to mock (see tests/test_save_capture.py).
+        """
+        target = self.get_capture_target()
+
+        if target.is_partial:
+            proceed = messagebox.askyesno(
+                "Partial capture",
+                (
+                    "The in-memory capture buffer is capped at "
+                    f"{_RAW_CAPTURE_MAX_BYTES} bytes, and the oldest bytes of "
+                    f"this {target.label} have already been discarded.\n\n"
+                    "Save the remaining bytes anyway?"
+                ),
+            )
+            if not proceed:
+                return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".bin",
+            filetypes=[("Captured ESC/POS bytes", "*.bin"), ("All files", "*.*")],
+            initialfile=target.default_filename,
+            title=f"Save capture: {target.label}",
+        )
+        if not path:
+            return
+        self.save_capture(path, target.data)
 
     def _on_clear_click(self) -> None:
         self.clear()

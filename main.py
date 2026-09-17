@@ -387,11 +387,20 @@ def _make_open_handler(
     """
 
     def on_open(path: str) -> None:
+        with open(path, "rb") as f:
+            raw_data = f.read()
         result = replay_file(path, implemented_codepages)
-        chunk_bytes = os.path.getsize(path)
+        chunk_bytes = len(raw_data)
         source = f"opened file: {os.path.basename(path)}"
         tagged_diagnostics = [dataclasses.replace(d, source=source) for d in result.diagnostics]
         viewer.call_soon(viewer.clear)
+        # The opened file's raw bytes feed the viewer's capture buffer
+        # (see render.viewer.Viewer.append_raw_bytes()) exactly like a
+        # live chunk would, so "Save capture..." has something honest to
+        # offer for a file that was loaded rather than received live.
+        # Must run after clear() (already queued above) so the previous
+        # session's buffered bytes are wiped first, not mixed in.
+        viewer.call_soon(viewer.append_raw_bytes, raw_data)
         viewer.call_soon(viewer.update_ops, result.ops, chunk_bytes, result.byte_offsets)
         if tagged_diagnostics:
             viewer.call_soon(viewer.add_diagnostics, tagged_diagnostics)
@@ -417,8 +426,10 @@ def run_replay(args: argparse.Namespace, width_dots: int, implemented_codepages:
     started -- this decouples renderer iteration from real hardware
     entirely.
     """
+    with open(args.replay, "rb") as f:
+        raw_data = f.read()
     result = replay_file(args.replay, implemented_codepages)
-    chunk_bytes = os.path.getsize(args.replay)
+    chunk_bytes = len(raw_data)
     status = TransportStatus(
         transport=args.transport,
         endpoint=_transport_endpoint_label(args),
@@ -434,6 +445,11 @@ def run_replay(args: argparse.Namespace, width_dots: int, implemented_codepages:
     viewer.set_open_handler(_make_open_handler(viewer, implemented_codepages))
 
     logger.info("replay mode: showing %s (no transport started)", args.replay)
+    # Feed the replayed file's raw bytes into the capture buffer too --
+    # see render.viewer.Viewer.append_raw_bytes() -- so "Save capture..."
+    # can honestly offer the loaded bytes even though no transport is
+    # running in replay mode.
+    viewer.append_raw_bytes(raw_data)
     viewer.update_ops(result.ops, chunk_bytes=chunk_bytes, byte_offsets=result.byte_offsets)
     if result.diagnostics:
         viewer.add_diagnostics(result.diagnostics)
@@ -514,6 +530,12 @@ def run(argv: list[str] | None = None) -> None:
         # the status bar and the session history panel could then never
         # be reconciled (see render.viewer.Viewer.update_ops()'s
         # docstring for the invariant this restores).
+        # Feed the viewer's in-memory raw capture buffer with the exact
+        # same chunk update_ops() below accounts for -- independent of
+        # --dump-bytes (dumper(chunk) above), which writes straight to
+        # disk and is unaffected by this buffer's cap. See
+        # render.viewer.Viewer.append_raw_bytes().
+        viewer.call_soon(viewer.append_raw_bytes, chunk)
         viewer.call_soon(viewer.update_ops, ops, len(chunk), byte_offsets)
         if diagnostics:
             viewer.call_soon(viewer.add_diagnostics, diagnostics)

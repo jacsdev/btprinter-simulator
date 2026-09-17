@@ -408,6 +408,9 @@ def test_run_with_replay_flag_does_not_build_a_transport(monkeypatch, tmp_path):
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             self.ops.extend(ops)
 
+        def append_raw_bytes(self, data):
+            pass
+
         def add_diagnostics(self, diagnostics):
             pass
 
@@ -446,6 +449,9 @@ def test_run_with_replay_flag_shows_replay_status_not_listening(monkeypatch, tmp
 
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             self.ops.extend(ops)
+
+        def append_raw_bytes(self, data):
+            pass
 
         def add_diagnostics(self, diagnostics):
             pass
@@ -487,6 +493,9 @@ def test_run_with_replay_flag_forwards_diagnostics_to_the_viewer(monkeypatch, tm
 
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             self.ops.extend(ops)
+
+        def append_raw_bytes(self, data):
+            pass
 
         def add_diagnostics(self, diagnostics):
             captured["diagnostics"] = list(diagnostics)
@@ -532,6 +541,9 @@ def test_make_open_handler_forwards_diagnostics_tagged_with_the_opened_files_sou
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             calls["ops"] = list(ops)
 
+        def append_raw_bytes(self, data):
+            calls["raw_bytes"] = data
+
         def add_diagnostics(self, diagnostics):
             calls["diagnostics"] = list(diagnostics)
 
@@ -548,6 +560,10 @@ def test_make_open_handler_forwards_diagnostics_tagged_with_the_opened_files_sou
     assert calls["diagnostics"] is not None
     assert len(calls["diagnostics"]) == 1
     assert "capture.bin" in calls["diagnostics"][0].source
+    # The opened file's raw bytes must reach the viewer's capture buffer
+    # too, byte-for-byte, so replay mode can still offer "Save capture..."
+    # for a file that was loaded rather than received live.
+    assert calls["raw_bytes"] == b"OK" + bytes([0x00]) + b"MORE\x0a"
 
 
 def test_make_open_handler_does_not_call_add_diagnostics_for_a_clean_file(tmp_path):
@@ -561,6 +577,9 @@ def test_make_open_handler_does_not_call_add_diagnostics_for_a_clean_file(tmp_pa
             pass
 
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
+            pass
+
+        def append_raw_bytes(self, data):
             pass
 
         def add_diagnostics(self, diagnostics):
@@ -590,10 +609,14 @@ def test_run_replay_status_matches_file_size_and_op_count(monkeypatch, tmp_path)
         def __init__(self, *a, **kw):
             self.ops = []
             self.status = kw.get("status")
+            self.raw_bytes = b""
             captured["viewer"] = self
 
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             self.ops.extend(ops)
+
+        def append_raw_bytes(self, data):
+            self.raw_bytes += data
 
         def add_diagnostics(self, diagnostics):
             pass
@@ -623,6 +646,11 @@ def test_run_replay_status_matches_file_size_and_op_count(monkeypatch, tmp_path)
     assert len(viewer.ops) == 2
     assert viewer.status.bytes_received == expected_bytes
     assert viewer.status.ops_count == 2
+    # --replay must also feed the loaded file's raw bytes into the
+    # viewer's capture buffer, so "Save capture..." has something honest
+    # to offer even though no transport is running (see render/viewer.py
+    # Viewer.append_raw_bytes()).
+    assert viewer.raw_bytes == capture.read_bytes()
 
 
 def test_run_replay_status_and_history_panel_agree_on_the_same_input(monkeypatch, tmp_path):
@@ -641,6 +669,9 @@ def test_run_replay_status_and_history_panel_agree_on_the_same_input(monkeypatch
             self.ops.extend(ops)
             captured["chunk_bytes"] = chunk_bytes
             captured["ops_len"] = len(ops)
+
+        def append_raw_bytes(self, data):
+            pass
 
         def add_diagnostics(self, diagnostics):
             pass
@@ -699,6 +730,9 @@ def test_make_open_handler_updates_status_accumulating_bytes_and_ops(tmp_path):
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             pass
 
+        def append_raw_bytes(self, data):
+            pass
+
         def add_diagnostics(self, diagnostics):
             pass
 
@@ -740,6 +774,9 @@ def test_run_replay_open_button_accumulates_on_top_of_initial_replay_status(monk
 
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             self.ops.extend(ops)
+
+        def append_raw_bytes(self, data):
+            pass
 
         def add_diagnostics(self, diagnostics):
             pass
@@ -823,6 +860,9 @@ def test_open_during_live_session_does_not_desync_status_store(monkeypatch, tmp_
             cb(*a)
 
         def update_ops(self, *a, **k):
+            pass
+
+        def append_raw_bytes(self, *a, **k):
             pass
 
         def add_diagnostics(self, *a, **k):
@@ -958,6 +998,9 @@ def test_on_data_calls_update_ops_even_for_a_chunk_that_completes_no_op(monkeypa
         def update_ops(self, ops, chunk_bytes=0, byte_offsets=None):
             update_ops_calls.append((list(ops), chunk_bytes, byte_offsets))
 
+        def append_raw_bytes(self, data):
+            pass
+
         def add_diagnostics(self, *a, **k):
             pass
 
@@ -1007,3 +1050,150 @@ def test_on_data_calls_update_ops_even_for_a_chunk_that_completes_no_op(monkeypa
     # must reconcile: it counted both chunks, update_ops saw both too.
     assert viewer.status.bytes_received == 1 + 2
     assert sum(chunk_bytes for _, chunk_bytes, _ in update_ops_calls) == viewer.status.bytes_received
+
+
+# -- Save capture...: on_data must also feed the viewer's in-memory raw
+# capture buffer, independently of --dump-bytes -------------------------
+
+
+def test_on_data_forwards_every_live_chunk_to_the_viewers_capture_buffer(monkeypatch):
+    class _FakePort:
+        def __init__(self):
+            self.on_data = None
+
+        def set_connection_listener(self, listener):
+            pass
+
+        def start(self, on_data):
+            self.on_data = on_data
+
+        def stop(self):
+            pass
+
+    fake_port = _FakePort()
+    monkeypatch.setattr(main, "build_transport", lambda *a, **k: fake_port)
+
+    captured_raw = []
+
+    class _FakeViewer:
+        def __init__(self, *a, **kw):
+            self.status = kw.get("status")
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def update_ops(self, *a, **k):
+            pass
+
+        def append_raw_bytes(self, data):
+            captured_raw.append(data)
+
+        def add_diagnostics(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeViewer)
+
+    main.run(["--transport", "tcp", "--port", "9100"])
+
+    fake_port.on_data(b"HELLO")
+    fake_port.on_data(b"\x0a")
+
+    assert captured_raw == [b"HELLO", b"\x0a"]
+
+
+def test_dump_bytes_and_viewer_capture_buffer_receive_the_same_chunks_independently(monkeypatch, tmp_path):
+    # --dump-bytes (a file on disk) and the viewer's in-memory capture
+    # buffer (backing "Save capture...") are two independent consumers
+    # of the exact same chunk. Neither must interfere with the other:
+    # the file gets every chunk appended, and the viewer's buffer gets
+    # every chunk too, each byte-for-byte.
+    dump_path = tmp_path / "dump.bin"
+
+    class _FakePort:
+        def __init__(self):
+            self.on_data = None
+
+        def set_connection_listener(self, listener):
+            pass
+
+        def start(self, on_data):
+            self.on_data = on_data
+
+        def stop(self):
+            pass
+
+    fake_port = _FakePort()
+    monkeypatch.setattr(main, "build_transport", lambda *a, **k: fake_port)
+
+    captured_raw = []
+    chunks = [b"FIRST ", b"SECOND ", b"THIRD\x0a"]
+
+    class _FakeViewer:
+        def __init__(self, *a, **kw):
+            self.status = kw.get("status")
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def update_ops(self, *a, **k):
+            pass
+
+        def append_raw_bytes(self, data):
+            captured_raw.append(data)
+
+        def add_diagnostics(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+        def run(self):
+            # Drive the chunks from inside run(), before main.run()'s
+            # `finally: dumper.close()` fires -- calling on_data() after
+            # main.run() has already returned would write to a closed
+            # file handle.
+            for chunk in chunks:
+                fake_port.on_data(chunk)
+
+    monkeypatch.setattr(main, "Viewer", _FakeViewer)
+
+    main.run(["--transport", "tcp", "--port", "9100", "--dump-bytes", str(dump_path)])
+
+    assert dump_path.read_bytes() == b"".join(chunks)
+    assert captured_raw == chunks

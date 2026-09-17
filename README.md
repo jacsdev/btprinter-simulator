@@ -155,6 +155,19 @@ Beyond the live receipt canvas, the window includes:
 - An **Open...** button: loads a previously captured byte file (see
   `--dump-bytes`) through a fresh parser and replaces the current
   content with it, while a live transport (if any) keeps running.
+- A **Save capture...** button: exports the raw ESC/POS bytes already
+  received this session, byte-for-byte, so they can be replayed later
+  with `--replay`. Unlike `--dump-bytes` (which must be decided before
+  launch), the viewer always buffers received bytes in memory, so a
+  capture can be exported retroactively after noticing a problem on
+  screen — capped at 8 MiB, keeping the most recent bytes and warning
+  before saving if the cap already dropped older ones. If a receipt is
+  selected in the session history panel when the button is pressed,
+  only that receipt's bytes are saved; otherwise the whole session is
+  saved. The save dialog's title always names which of the two is about
+  to be written. In replay mode, this exports the loaded file's bytes
+  (or the selected receipt's slice of them) since no live transport is
+  running.
 - Receipts are split into separate visual blocks at each `GS V`
   (paper cut) command, drawn with a visible gap between them, so
   several prints in one session read as several receipts instead of
