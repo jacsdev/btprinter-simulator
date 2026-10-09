@@ -107,6 +107,24 @@ class _FakeServerSocket:
             raise self.close_raises
 
 
+class _SettimeoutRaisingServerSocket:
+    """Stands in for a listening socket whose settimeout() call fails."""
+
+    def settimeout(self, timeout: float) -> None:
+        raise OSError("simulated settimeout failure")
+
+
+class _AcceptRaisingServerSocket:
+    """Stands in for a listening socket whose accept() call fails with a
+    real (non-timeout) OSError."""
+
+    def settimeout(self, timeout: float) -> None:
+        pass
+
+    def accept(self):
+        raise OSError("simulated accept failure")
+
+
 def _noop_register(channel: int, name: str) -> None:
     pass
 
@@ -491,6 +509,37 @@ def test_sdp_mode_auto_falls_back_to_simple_when_blob_registration_fails():
         port.stop()
 
 
+def test_sdp_mode_auto_fallback_logs_a_warning(caplog):
+    simple_calls = []
+
+    def failing_blob(channel: int, name: str) -> int:
+        raise SdpRegistrationError(1231, "blob register")
+
+    def spy_simple(channel: int, name: str) -> None:
+        simple_calls.append(channel)
+
+    server = _FakeServerSocket(channel=4, clients=[])
+    port = RfcommPort(
+        _socket_factory=lambda: server,
+        _register_sdp=spy_simple,
+        _deregister_sdp=_noop_deregister,
+        sdp_mode="auto",
+        _register_sdp_blob=failing_blob,
+    )
+    with caplog.at_level(logging.DEBUG, logger="btprinter.transport.rfcomm"):
+        port.start(lambda chunk: None)
+    try:
+        assert simple_calls == [4]
+        assert port._sdp_mode_used == "simple"
+    finally:
+        port.stop()
+    assert any(
+        record.levelno == logging.WARNING
+        and "blob registration failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_stop_deregisters_via_blob_path_when_blob_mode_was_used():
     blob_dereg_calls = []
     simple_dereg_calls = []
@@ -532,6 +581,55 @@ def test_stop_deregisters_via_simple_path_when_auto_fell_back_to_simple():
 
     assert simple_dereg_calls == [4]
     assert blob_dereg_calls == []
+
+
+def test_stop_deregisters_blob_even_when_the_recorded_handle_is_zero():
+    blob_dereg_calls = []
+    simple_dereg_calls = []
+
+    server = _FakeServerSocket(channel=4, clients=[])
+    port = RfcommPort(
+        _socket_factory=lambda: server,
+        _register_sdp=_noop_register,
+        _deregister_sdp=lambda channel, name: simple_dereg_calls.append(channel),
+        sdp_mode="blob",
+        _register_sdp_blob=lambda channel, name: 0,
+        _deregister_sdp_blob=lambda handle: blob_dereg_calls.append(handle),
+    )
+    port.start(lambda chunk: None)
+    assert port._blob_registered is True
+    port.stop()
+
+    assert blob_dereg_calls == [0]
+    assert simple_dereg_calls == []
+    assert port._blob_registered is False
+
+
+def test_restart_after_stop_re_registers_and_deregisters_blob_freshly():
+    blob_dereg_calls = []
+    simple_dereg_calls = []
+    servers = iter(
+        [
+            _FakeServerSocket(channel=4, clients=[]),
+            _FakeServerSocket(channel=5, clients=[]),
+        ]
+    )
+
+    port = RfcommPort(
+        _socket_factory=lambda: next(servers),
+        _register_sdp=_noop_register,
+        _deregister_sdp=lambda channel, name: simple_dereg_calls.append(channel),
+        sdp_mode="blob",
+        _register_sdp_blob=lambda channel, name: 88,
+        _deregister_sdp_blob=lambda handle: blob_dereg_calls.append(handle),
+    )
+    port.start(lambda chunk: None)
+    port.stop()
+    port.start(lambda chunk: None)
+    port.stop()
+
+    assert blob_dereg_calls == [88, 88]
+    assert simple_dereg_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +972,24 @@ def test_rfcomm_port_listener_exception_does_not_kill_the_accept_read_loop():
         port.stop()  # must not raise despite the "stopped" event's listener
 
     assert b"HELLO" in b"".join(received)
+
+
+def test_accept_loop_logs_and_returns_when_settimeout_raises_oserror(caplog):
+    port = RfcommPort()
+    port._server_socket = _SettimeoutRaisingServerSocket()
+    port._running = True
+    with caplog.at_level(logging.DEBUG, logger="btprinter.transport.rfcomm"):
+        port._accept_loop()  # must return without raising
+    assert "accept poll timeout" in caplog.text
+
+
+def test_accept_loop_logs_and_breaks_when_accept_raises_oserror(caplog):
+    port = RfcommPort()
+    port._server_socket = _AcceptRaisingServerSocket()
+    port._running = True
+    with caplog.at_level(logging.DEBUG, logger="btprinter.transport.rfcomm"):
+        port._accept_loop()  # must break without raising
+    assert "accept failed" in caplog.text
 
 
 # ---------------------------------------------------------------------------

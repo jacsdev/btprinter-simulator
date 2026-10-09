@@ -9,6 +9,7 @@ never need to pass it.
 
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -19,7 +20,9 @@ from transport.rfcomm import (
     _bind_available_channel,
     _default_rfcomm_socket,
     deregister_sdp_service,
+    deregister_sdp_service_blob,
     register_sdp_service,
+    register_sdp_service_blob,
 )
 
 _SPP_UUID = "00001101-0000-1000-8000-00805F9B34FB"
@@ -83,7 +86,9 @@ def check_rfcomm_socket_bind() -> CheckResult:
 
 def check_sdp_registration() -> CheckResult:
     """Register and immediately deregister an SDP record via the same
-    code path RfcommPort uses in production, on a throwaway channel."""
+    code path RfcommPort uses in production (--sdp-mode auto): try the
+    hand-built blob record first, then fall back to the simple record,
+    on a throwaway channel."""
     try:
         probe, channel = _bind_available_channel(_default_rfcomm_socket)
     except OSError as exc:
@@ -92,21 +97,32 @@ def check_sdp_registration() -> CheckResult:
         return CheckResult("UNKNOWN", f"could not bind a probe channel to test SDP registration: {exc}")
     service_name = "58mm Thermal Printer Simulator (doctor probe)"
     try:
+        record_kind = None
+        blob_handle = None
         try:
-            register_sdp_service(channel, service_name)
-        except SdpRegistrationError as exc:
-            return CheckResult(
-                "FAIL",
-                f"WSASetServiceW failed with Win32 error {exc.win32_error_code}. "
-                "Remedy: confirm the Bluetooth Support Service is running and retry as Administrator.",
-            )
+            blob_handle = register_sdp_service_blob(channel, service_name)
+            record_kind = "blob"
+        except SdpRegistrationError:
+            try:
+                register_sdp_service(channel, service_name)
+                record_kind = "simple"
+            except SdpRegistrationError as exc:
+                return CheckResult(
+                    "FAIL",
+                    f"WSASetServiceW failed with Win32 error {exc.win32_error_code}. "
+                    "Remedy: confirm the Bluetooth Support Service is running and retry as Administrator.",
+                )
         try:
-            deregister_sdp_service(channel, service_name)
+            if record_kind == "blob":
+                deregister_sdp_service_blob(blob_handle)
+            else:
+                deregister_sdp_service(channel, service_name)
         except SdpRegistrationError:
             pass  # best-effort cleanup of the probe registration
+        record_label = "blob record" if record_kind == "blob" else "simple record"
         return CheckResult(
             "PASS",
-            f"published SDP record for SPP UUID {_SPP_UUID} on channel {channel}",
+            f"published SDP record for SPP UUID {_SPP_UUID} on channel {channel} ({record_label})",
         )
     finally:
         probe.close()
@@ -149,36 +165,51 @@ def list_paired_bluetooth_devices(runner: _SubprocessRunner = subprocess.run) ->
     return CheckResult("PASS", completed.stdout.strip() or "no Bluetooth devices found")
 
 
-def check_interpreter_restriction(executable: str = "") -> CheckResult:
-    """Flag whether the running interpreter looks like a Microsoft Store /
-    AppContainer-restricted Python build (installed under `WindowsApps`).
+def check_interpreter_restriction() -> CheckResult:
+    """Check the real process token's `TokenIsAppContainer` flag via
+    `ctypes` instead of guessing from the interpreter install path.
 
-    This is deliberately a WARNING, never a FAIL: it is an UNTESTED
-    possibility, not a confirmed root cause. Store Python builds run
-    inside an AppContainer sandbox that MAY restrict inbound Bluetooth
-    connections even when SDP registration and RFCOMM bind/listen both
-    succeed -- which would match this simulator's real symptom (a paired
-    phone's RFCOMM connect attempt never reaching the accept loop, with
-    nothing logged). Retrying with a python.org installation (not a
-    Microsoft Store one) is a valid diagnostic step to rule this in or
-    out; this check cannot do that itself.
+    This is deliberately a WARNING, never a FAIL: an AppContainer token
+    is a possibility, not a confirmed root cause. Store Python builds
+    run inside an AppContainer sandbox that MAY restrict inbound
+    Bluetooth connections even when SDP registration and RFCOMM
+    bind/listen both succeed -- which would match this simulator's real
+    symptom (a paired phone's RFCOMM connect attempt never reaching the
+    accept loop, with nothing logged). Retrying with a python.org
+    installation (not a Microsoft Store one) is a valid diagnostic step
+    to rule this in or out; this check cannot do that itself.
     """
-    interpreter = executable or sys.executable or ""
-    if "WindowsApps" in interpreter:
+    if sys.platform != "win32":
+        return CheckResult("UNKNOWN", "AppContainer token check is Windows-only")
+    try:
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        token = ctypes.c_void_p()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+        ):
+            raise ctypes.WinError()
+    except Exception as exc:
+        return CheckResult("UNKNOWN", f"could not open the process token: {exc}")
+    try:
+        flag = ctypes.c_ulong(0)
+        returned = ctypes.c_ulong(0)
+        if not advapi32.GetTokenInformation(
+            token, 29, ctypes.byref(flag), ctypes.sizeof(flag), ctypes.byref(returned)
+        ):
+            raise ctypes.WinError()
+    except Exception as exc:
+        return CheckResult("UNKNOWN", f"could not read the AppContainer token flag: {exc}")
+    if flag.value != 0:
         return CheckResult(
             "WARNING",
-            f"running interpreter '{interpreter}' appears to be a Microsoft "
-            "Store / AppContainer-restricted Python build. This is an "
-            "UNTESTED possibility, not a confirmed cause of any connection "
-            "failure: Store Python builds may restrict inbound Bluetooth "
-            "connections even when SDP registration and RFCOMM bind/listen "
-            "both succeed. Retrying with a python.org (non-Store) Python "
-            "installation is a valid diagnostic step to rule this in or out.",
+            "this process is running under an AppContainer token, which may restrict "
+            "inbound Bluetooth connections. This is a possibility, not a confirmed "
+            "cause of the RFCOMM connection failure: retrying with a python.org "
+            "(non-Store) Python installation is a valid diagnostic step to rule "
+            "this in or out.",
         )
-    return CheckResult(
-        "PASS",
-        f"running interpreter '{interpreter}' does not look like a Microsoft Store build",
-    )
+    return CheckResult("PASS", "not AppContainer-restricted")
 
 
 def list_bluetooth_com_ports(runner: _SubprocessRunner = subprocess.run) -> CheckResult:

@@ -383,7 +383,7 @@ SdpMode = Literal["auto", "simple", "blob"]
   silently falling back would hide the failure this mode is meant to
   surface.
 - "auto" (default): try "blob" first; if it raises for any reason, log
-  the failure at INFO level and fall back to "simple". This is the mode
+  the failure at WARNING level and fall back to "simple". This is the mode
   real runs should use, since a working blob record is strictly better
   (see transport/sdp_encoding.py) but must never make the simulator
   refuse to start on a Windows build where the blob path fails.
@@ -477,6 +477,7 @@ class RfcommPort(Port):
         self._sdp_registered = False
         self._sdp_mode_used: Optional[str] = None
         self._blob_record_handle: Optional[int] = None
+        self._blob_registered = False
 
     @property
     def actual_channel(self) -> int:
@@ -526,6 +527,7 @@ class RfcommPort(Port):
             return
         if self._sdp_mode == "blob":
             self._blob_record_handle = self._register_sdp_blob(channel, self._service_name)
+            self._blob_registered = True
             self._sdp_mode_used = "blob"
             logger.info("SDP registration mode: blob (--sdp-mode blob)")
             return
@@ -535,10 +537,11 @@ class RfcommPort(Port):
         # build where the blob path fails still starts the simulator.
         try:
             self._blob_record_handle = self._register_sdp_blob(channel, self._service_name)
+            self._blob_registered = True
             self._sdp_mode_used = "blob"
             logger.info("SDP registration mode: blob (auto: blob registration succeeded)")
         except Exception as exc:
-            logger.info(
+            logger.warning(
                 "SDP registration mode: simple (auto: blob registration failed, falling back: %s)",
                 exc,
             )
@@ -552,6 +555,9 @@ class RfcommPort(Port):
         try:
             server.settimeout(_ACCEPT_POLL_INTERVAL)
         except OSError:
+            logger.exception(
+                "failed to set the RFCOMM accept poll timeout; accept loop will not run"
+            )
             return
         while self._running:
             try:
@@ -559,6 +565,7 @@ class RfcommPort(Port):
             except socket.timeout:
                 continue
             except OSError:
+                logger.exception("RFCOMM accept failed; stopping the accept loop")
                 break
             logger.info("client connected from %s", addr)
             self._emit_connection_event("connected", peer=str(addr[0]))
@@ -611,7 +618,7 @@ class RfcommPort(Port):
             if self._sdp_registered:
                 channel = self.actual_channel
                 try:
-                    if self._sdp_mode_used == "blob" and self._blob_record_handle:
+                    if self._sdp_mode_used == "blob" and self._blob_registered:
                         self._deregister_sdp_blob(self._blob_record_handle)
                     else:
                         self._deregister_sdp(channel, self._service_name)
@@ -624,6 +631,7 @@ class RfcommPort(Port):
                     self._sdp_registered = False
                     self._sdp_mode_used = None
                     self._blob_record_handle = None
+                    self._blob_registered = False
         finally:
             self._cleanup_sockets()
         logger.info("RFCOMM listener stopped")
