@@ -516,6 +516,8 @@ def run(argv: list[str] | None = None) -> None:
         ops = parser.feed(chunk)
         diagnostics = parser.take_diagnostics()
         byte_offsets = parser.take_op_offsets()
+        for response in parser.take_status_responses():
+            transport_port.write(response)
         status_store.update(lambda status: status.add_bytes(len(chunk)).add_ops(len(ops)))
         # Tkinter is not thread-safe: hop back onto the main/UI thread
         # before touching any widget from the transport's background

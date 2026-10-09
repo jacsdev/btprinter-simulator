@@ -1197,3 +1197,77 @@ def test_dump_bytes_and_viewer_capture_buffer_receive_the_same_chunks_independen
 
     assert dump_path.read_bytes() == b"".join(chunks)
     assert captured_raw == chunks
+
+
+# -- real-time status responses are written back to the transport port -----
+
+
+def test_on_data_writes_status_response_back_to_the_transport_port(monkeypatch):
+    # The parser produces DLE EOT status response bytes as pure data (it
+    # never touches a socket); on_data must drain them and write them back
+    # through the transport port so a peer that actually reads can see the
+    # healthy 0x12 answer.
+    class _FakePort:
+        def __init__(self):
+            self.on_data = None
+            self.written: list[bytes] = []
+
+        def set_connection_listener(self, listener):
+            pass
+
+        def start(self, on_data):
+            self.on_data = on_data
+
+        def stop(self):
+            pass
+
+        def write(self, data: bytes):
+            self.written.append(data)
+
+    fake_port = _FakePort()
+    monkeypatch.setattr(main, "build_transport", lambda *a, **k: fake_port)
+
+    class _FakeViewer:
+        def __init__(self, *a, **kw):
+            self.status = kw.get("status")
+
+        def call_soon(self, cb, *a):
+            cb(*a)
+
+        def update_ops(self, *a, **k):
+            pass
+
+        def append_raw_bytes(self, *a, **k):
+            pass
+
+        def add_diagnostics(self, *a, **k):
+            pass
+
+        def clear(self):
+            pass
+
+        def set_title(self, *a, **k):
+            pass
+
+        def set_clear_handler(self, *a, **k):
+            pass
+
+        def set_open_handler(self, *a, **k):
+            pass
+
+        def get_status(self):
+            return self.status
+
+        def update_status(self, status):
+            self.status = status
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(main, "Viewer", _FakeViewer)
+
+    main.run(["--transport", "tcp", "--port", "9100"])
+
+    fake_port.on_data(b"\x10\x04\x01")
+
+    assert fake_port.written == [b"\x12"]

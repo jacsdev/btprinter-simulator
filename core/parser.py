@@ -113,6 +113,11 @@ class Parser:
         # raw chunk size. Purely additive bookkeeping -- it never affects
         # feed()'s return value or any parsing decision.
         self._op_offsets: List[int] = []
+        # Real-time status responses produced by DLE EOT n queries (see
+        # take_status_responses()): pure data, drained by the composition
+        # root and written back to the transport. The parser never writes
+        # to a socket itself -- it only PRODUCES the response bytes.
+        self._status_responses: List[bytes] = []
         # Code page ids this simulated printer's firmware actually has a
         # table for. Real cheap thermal printers only implement a subset
         # of the ids a profile might claim to support; requesting one
@@ -196,6 +201,20 @@ class Parser:
         diagnostics = self._diagnostics
         self._diagnostics = []
         return diagnostics
+
+    def take_status_responses(self) -> List[bytes]:
+        """Return and clear the real-time status responses collected so far.
+
+        This is the polling counterpart to `_parse_dle`'s DLE EOT
+        handling: every supported real-time status query appends one
+        response byte here, and a caller (typically the composition root,
+        right after each `feed()`) drains this list and writes each entry
+        back to the connected peer. Draining rather than just reading
+        avoids double-answering the same query on a later call.
+        """
+        responses = self._status_responses
+        self._status_responses = []
+        return responses
 
     # -- dispatch -----------------------------------------------------
 
@@ -294,12 +313,20 @@ class Parser:
             return self._skip_unknown(buf, 1)
         if len(buf) < 3:
             return _NEED_MORE
-        # DLE EOT n: real-time status query. The transport used by the
-        # mobile app (print_bluetooth_thermal) is write-only and never
-        # reads a response, so this is parsed only to stay in sync with
-        # the stream and then discarded.
+        # DLE EOT n: real-time status query. v1 models the printer as
+        # permanently healthy (online, paper present, cover closed, no
+        # error), so every supported n ({1, 2, 3, 4}) answers with the
+        # same "all clear" byte 0x12 (bits 1 and 4 set). Any other n is
+        # consumed and discarded with no response, preserving the old
+        # write-only behavior.
+        n = buf[2]
+        if n in (1, 2, 3, 4):
+            self._status_responses.append(b"\x12")
+            return 3, []
         logger.debug(
-            "discarded DLE EOT status query at offset %d", self._stream_offset
+            "discarded DLE EOT status query at offset %d (unsupported n=%d)",
+            self._stream_offset,
+            n,
         )
         return 3, []
 
